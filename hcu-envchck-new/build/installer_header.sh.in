@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# 文件功能：校验内嵌离线包并调用普通用户安装器；--help 不解包、不安装。
+set -euo pipefail
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    printf 'hcu-envcheck @VERSION@ Linux @ARCH@ 离线用户安装包\n用法：./安装包.run [--prefix DIR] [--no-path]\n默认安装到 $HOME/.local，无需 root 或系统 Python。\n'
+    exit 0
+fi
+[[ $(uname -s) == Linux ]] || { echo '[INSTALL-ERROR] 请在 Linux 执行' >&2; exit 1; }
+work=$(mktemp -d "${TMPDIR:-/tmp}/hcu-envcheck-installer.XXXXXXXX")
+trap '[[ -z ${work:-} || $work != */hcu-envcheck-installer.* ]] || rm -rf -- "$work"' EXIT
+line=$(awk '$0=="__HCU_ARCHIVE_BELOW__" {print NR+1; exit}' "$0")
+[[ $line =~ ^[0-9]+$ ]] || { echo '[INSTALL-ERROR] 安装包载荷缺失' >&2; exit 1; }
+tail -n +"$line" "$0" > "$work/payload.tar.gz"
+(cd -- "$work" && printf '@PAYLOAD_SHA@  payload.tar.gz\n' | sha256sum --check --status -) || { echo '[INSTALL-ERROR] 安装包载荷校验失败' >&2; exit 1; }
+tar -xzf "$work/payload.tar.gz" -C "$work"
+bash "$work/hcu-envcheck-@VERSION@/install.sh" "$@"
+exit 0
+__HCU_ARCHIVE_BELOW__

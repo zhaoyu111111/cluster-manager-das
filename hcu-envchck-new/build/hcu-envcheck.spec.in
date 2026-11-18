@@ -1,0 +1,52 @@
+# 文件功能：把与离线 tar.gz 相同的工具和私有 Python 安装为普通 RPM。
+# 职责边界：不提权、不执行检测、不拉取容器镜像、不覆盖已有容器。
+Name: hcu-envcheck
+Version: @VERSION@
+Release: @RELEASE@
+Summary: Cluster environment checks with a private Python runtime
+License: Apache-2.0
+ExclusiveArch: @ARCH@
+Source0: %{name}-%{version}.tar.gz
+AutoReqProv: no
+Requires: bash
+Requires: openssh-clients
+%global debug_package %{nil}
+%global __brp_python_bytecompile %{nil}
+%global __os_install_post %{nil}
+
+%description
+Python cluster controller with isolated runtime and per-task container payloads.
+Docker, toolkit and test dependencies are provided by target environments.
+
+%prep
+%setup -q
+
+%build
+
+%install
+mkdir -p %{buildroot}@INSTALL_PREFIX@ %{buildroot}/usr/bin
+cp -a . %{buildroot}@INSTALL_PREFIX@/
+chmod 0755 %{buildroot}@INSTALL_PREFIX@/bin/hcu-cluster-run
+ln -s @INSTALL_PREFIX@/bin/hcu-cluster-run %{buildroot}/usr/bin/hcu-cluster-run
+
+%files
+%defattr(-,root,root,-)
+%dir @INSTALL_PREFIX@
+@INSTALL_PREFIX@/bin
+@INSTALL_PREFIX@/runtime
+@INSTALL_PREFIX@/hcu_envcheck
+@INSTALL_PREFIX@/third_party
+@INSTALL_PREFIX@/docs
+@INSTALL_PREFIX@/build
+%dir @INSTALL_PREFIX@/config
+%config(noreplace) @INSTALL_PREFIX@/config/rccl_baseline.conf
+%config(noreplace) @INSTALL_PREFIX@/config/env.sh
+%config(noreplace) @INSTALL_PREFIX@/config/site_env.sh
+@INSTALL_PREFIX@/VERSION
+@INSTALL_PREFIX@/README.md
+@INSTALL_PREFIX@/requirements.txt
+@INSTALL_PREFIX@/BUILD-MANIFEST.json
+@INSTALL_PREFIX@/INSTALL-MANIFEST.sha256
+@INSTALL_PREFIX@/install.sh
+@INSTALL_PREFIX@/uninstall.sh
+/usr/bin/hcu-cluster-run

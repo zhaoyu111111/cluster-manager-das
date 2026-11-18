@@ -1,0 +1,9 @@
+# nThread 1 nGpus 1 minBytes 4 maxBytes 16 step: 2(factor)
+# Rank 0 Group 0 Pid 100 on node001 device 0
+# Rank 1 Group 0 Pid 101 on node001 device 1
+# size count type redop root time algbw busbw #wrong time algbw busbw #wrong
+4 1 float sum -1 1.0 10 8 0 1.1 12 9 0
+8 2 float sum -1 1.0 20 16 0 1.1 22 18 0
+16 4 float sum -1 1.0 30 24 0 1.1 32 27 0
+# Avg bus bandwidth : 18
+rccl test done

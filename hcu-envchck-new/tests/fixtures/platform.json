@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "system": {"os_release": {"PRETTY_NAME": "Test Linux"}, "kernel": "test-kernel", "meminfo": {"MemTotal": "1024 kB"}},
+  "driver": {"modules": ["hycu 123 0"], "device_nodes": ["/dev/kfd"]},
+  "dtk": {"version_file": {"value": "test-dtk"}, "tools": {"hipcc": {"path": "/test/hipcc", "version": {"rc": 0, "stdout": "HIP test"}}, "hy-smi": {"driver_version": {"rc": 0, "stdout": "Driver Version: test-driver"}}}},
+  "python": {"version": "3.12", "packages": {"torch": "test-torch", "transformer_engine": "test-te", "deep-ep": "test-ep"}},
+  "torch": {"importable": true, "version": "test-torch", "hip_version": "test-hip", "hcu_available": true, "device_count": 2, "distributed_available": true, "distributed_nccl_available": true},
+  "hcu_hardware": {"status": "COLLECTED", "devices": [{"model": "TEST_CARD", "architecture": "gfx-test", "compute_units": 80, "memory_bytes": 68719476736}]},
+  "libraries": {"paths": ["/test/librccl.so"]},
+  "network": {"interfaces": [], "rdma_devices": []}
+}

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# 文件功能：定位私有 Python 运行时并启动 Python 主程序；不解析业务参数。
+# 职责边界：只为控制进程配置运行时，保存原环境供 subprocess 恢复。
+set -uo pipefail
+
+# 功能：解析启动器自身的符号链接，保留父目录的逻辑挂载路径。
+launcher_directory() {
+    local launcher_path=$1 launcher_parent launcher_link
+    while [[ -h $launcher_path ]]; do
+        launcher_parent=$(CDPATH= cd -- "$(dirname -- "$launcher_path")" && pwd) || return
+        launcher_link=$(readlink -- "$launcher_path") || return
+        case $launcher_link in /*) launcher_path=$launcher_link ;; *) launcher_path=$launcher_parent/$launcher_link ;; esac
+    done
+    CDPATH= cd -- "$(dirname -- "$launcher_path")" && pwd
+}
+
+# 功能：保存控制进程配置运行时前的环境，避免 SSH/Docker 继承工具库路径。
+launcher_save_environment() {
+    local launcher_name launcher_set launcher_value
+    for launcher_name in PYTHONHOME PYTHONPATH LD_LIBRARY_PATH PATH VIRTUAL_ENV CONDA_PREFIX CONDA_DEFAULT_ENV; do
+        launcher_set=HCU_LAUNCH_ORIGINAL_${launcher_name}_SET
+        launcher_value=HCU_LAUNCH_ORIGINAL_${launcher_name}
+        if [[ -v $launcher_name ]]; then
+            printf -v "$launcher_set" '%s' 1
+            printf -v "$launcher_value" '%s' "${!launcher_name}"
+        else
+            printf -v "$launcher_set" '%s' 0
+            printf -v "$launcher_value" '%s' ''
+        fi
+        export "$launcher_set" "$launcher_value"
+    done
+}
+
+launcher_bin=$(launcher_directory "${BASH_SOURCE[0]}") || exit 70
+launcher_root=$(CDPATH= cd -- "$launcher_bin/.." && pwd) || exit 70
+launcher_save_environment
+launcher_runtime=$launcher_root/runtime
+[[ -x "$launcher_runtime/bin/python3" ]] || launcher_runtime=${HCU_CONTROL_RUNTIME:-$launcher_runtime}
+if [[ -x "$launcher_runtime/bin/python3" ]]; then
+    launcher_python=$launcher_runtime/bin/python3
+    export PYTHONHOME=$launcher_runtime
+    export LD_LIBRARY_PATH="$launcher_runtime/lib:$launcher_runtime/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+elif [[ -n ${HCU_CONTROL_PYTHON:-} ]]; then
+    launcher_python=$HCU_CONTROL_PYTHON
+    [[ -x $launcher_python ]] || { printf '[ERROR] HCU_CONTROL_PYTHON 不可执行：%s\n' "$launcher_python" >&2; exit 69; }
+else
+    printf '[ERROR] 缺少 runtime/bin/python3；请使用 runtime 离线发行包。源码开发可显式设置 HCU_CONTROL_PYTHON。\n' >&2
+    exit 69
+fi
+# 不切换调用者工作目录；hostfile、输出路径仍按命令启动位置解析。
+export PYTHONPATH=$launcher_root
+launcher_entry=__main__.py
+# hcu-cluster-run clush ... 使用包内 ClusterShell，便于手工重跑日志中的命令。
+if [[ ${1:-} == clush ]]; then
+    shift
+    launcher_entry=clush_entry.py
+fi
+exec "$launcher_python" -B -s "$launcher_root/hcu_envcheck/$launcher_entry" "$@"
