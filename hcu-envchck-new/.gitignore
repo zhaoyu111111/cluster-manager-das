@@ -1,0 +1,9 @@
+verify_results/
+runtime/
+dist/
+!build/
+!build/**
+build/.staging-*/
+__pycache__/
+*.py[cod]
+!tests/fixtures/*.log

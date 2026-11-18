@@ -1,0 +1,25 @@
+Agent 1
+  Name: CPU_TEST
+  Device Type: CPU
+Agent 2
+  Name: gfx-test
+  Marketing Name: TEST_CARD
+  Device Type: HCU
+  Compute Unit: 80
+  Pool 1
+    Segment: GLOBAL; FLAGS: FINE GRAINED
+    Size: 64 GiB
+  Pool 2
+    Segment: GLOBAL; FLAGS: COARSE GRAINED
+    Size: 64 GiB
+  Pool 3
+    Segment: GROUP
+    Size: 64 KB
+Agent 3
+  Name: gfx-test
+  Marketing Name: TEST_CARD
+  Device Type: GPU
+  Compute Unit: 80
+  Pool 1
+    Segment: GLOBAL
+    Size: 67108864 (0x4000000) KB

@@ -9,3 +9,11 @@
 	path = hcu-envcheck/third-party/DeepEP
 	url = http://42.228.13.241:10068/dcutoolkit/deeplearing/DeepEP.git
 	branch = ci-release
+[submodule "hcu-envchck-new/third_party/DeepEP"]
+	path = hcu-envchck-new/third_party/DeepEP
+	url = http://42.228.13.241:10068/dcutoolkit/deeplearing/DeepEP.git
+	branch = ci-release
+[submodule "hcu-envchck-new/third_party/flux"]
+	path = hcu-envchck-new/third_party/flux
+	url = http://42.228.13.241:10068/dcutoolkit/deeplearing/flux.git
+	branch = develop-dtk

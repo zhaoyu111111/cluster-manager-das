@@ -1,0 +1,3 @@
+# 控制端依赖，由 build/build_package.sh --wheel-dir 离线装入私有 runtime。
+# Torch、DeepEP 等检测对象的依赖由目标容器/Conda 环境提供。
+ClusterShell>=1.9
