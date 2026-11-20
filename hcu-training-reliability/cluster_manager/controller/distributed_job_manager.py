@@ -4,6 +4,7 @@
 import time
 import sys
 from datetime import datetime
+from pathlib import Path
 from cluster_manager.runtime.runtime_context import RuntimeContext
 from cluster_manager.runtime.job_state_machine import JobStateMachine, JobCommand
 from cluster_manager.runtime.run_state_manager import RunState
@@ -13,9 +14,12 @@ from cluster_manager.launcher.launcher_factory import create_launcher
 from cluster_manager.config.global_config import logger
 import cluster_manager.config.global_config as global_config
 from cluster_manager.node_management.node_pool import NodePool
+from cluster_manager.node_management.hostfile_handler import HostfileHandler
+from cluster_manager.node_management.supernodes import SupernodeTopology
 from cluster_manager.monitor.nhc_monitor import NodePoolProxy
 from cluster_manager.platform.notify import Notify
 from cluster_manager.node_management.slurm_manager import SlurmMgr
+from cluster_manager.utils.file_utils import write_ordered_hostfile
 
 
 class DistributedJobManager:
@@ -34,10 +38,15 @@ class DistributedJobManager:
 
     def __init__(self, runtime_args: dict, workspace_dir):
         self.runtime_args = runtime_args
+        topology_path = runtime_args.get("supernodes_config")
+        self.topology = SupernodeTopology.from_file(topology_path) if topology_path else None
         self.workspace_dir = workspace_dir
         self.job_name = runtime_args.get("job_name", "rctest")
         self.job_id = runtime_args.get("job_id", "rctest")
-        self.hostfile = runtime_args.get("hostfile", f"{workspace_dir}/hostfile")
+        if self.topology is not None:
+            self.hostfile = str(Path(workspace_dir) / "allocation.hostfile")
+        else:
+            self.hostfile = runtime_args.get("hostfile", f"{workspace_dir}/hostfile")
         self.sbatch_script = runtime_args.get("sbatch_script", global_config.SBATCH_SCRIPT)
         self.cluster_schedule = runtime_args.get(
             "cluster_schedule", global_config.CLUSTER_SCHEDULE
@@ -51,6 +60,7 @@ class DistributedJobManager:
             self.slurm_mgr = SlurmMgr(
                 self.job_name, self.sbatch_script, self.hostfile, self.job_id
             )
+            self.slurm_mgr.refresh_allocation_hostfile = self.topology is not None
         self.ctx = None
         self.state_machine = None
         self.log_monitor = None
@@ -62,6 +72,18 @@ class DistributedJobManager:
         """唯一入口：检查队列 → 更新 hostfile → 初始化 → 状态恢复 → 主循环"""
         if self.slurm_mgr is not None:
             self._ensure_slurm_job()
+            if self.topology is not None:
+                hosts = HostfileHandler.read(self.hostfile)
+                if not hosts:
+                    raise ValueError(f"Empty or unreadable Slurm allocation: {self.hostfile}")
+                self.topology.validate_hosts(hosts)
+        elif getattr(self, "topology", None) is not None:
+            hosts = self.topology.compute_hosts()
+            required = self.runtime_args["required_nodes_num"]
+            if len(hosts) < required:
+                raise ValueError(f"Supernode configuration contains {len(hosts)} hosts; --nodes_num requires {required}")
+            write_ordered_hostfile(self.hostfile, hosts)
+            logger.info("[Manager] Wrote %d configured compute hosts to %s", len(hosts), self.hostfile)
         prepare_containers = getattr(self.launcher, "prepare_containers", None)
         if callable(prepare_containers):
             code, failed_nodes = prepare_containers(
@@ -89,7 +111,10 @@ class DistributedJobManager:
         if self.ctx and hasattr(self.ctx, 'node_pool_proxy'):
             self.ctx.node_pool_proxy.stop_monitor()
 
-        node_pool = NodePool(self.workspace_dir, self.hostfile)
+        node_pool = NodePool(
+            self.workspace_dir, self.hostfile, topology=self.topology,
+            restore_additional=self.topology is None and self.slurm_mgr is None,
+        )
         node_pool_proxy = NodePoolProxy(node_pool, self.event_bus, slurm_mgr=self.slurm_mgr)
         node_pool_proxy.start_monitor()
         self.ctx = RuntimeContext(self.runtime_args, node_pool_proxy)
@@ -126,6 +151,11 @@ class DistributedJobManager:
 
     def _restore_state(self):
         """根据磁盘状态恢复运行：引导状态机，按需启动 log_monitor"""
+        if self.runtime_args.get("supernodes_config"):
+            if self.ctx.run_state == RunState.INIT:
+                self.ctx.node_pool_proxy.clear_confirmed_layout()
+            elif self.ctx.run_state in (RunState.PENDING, RunState.RUNNING):
+                self.ctx.node_pool_proxy.restore_legacy_layout(self.runtime_args["slots_per_node"])
         self.state_machine.init_state()
         if self.ctx.run_state in (RunState.PENDING, RunState.RUNNING):
             self.log_monitor.start()
@@ -201,6 +231,12 @@ class DistributedJobManager:
                     self.runtime_args["slots_per_node"])
                 if not master:
                     if self.cluster_schedule == "NONE":
+                        if self.runtime_args.get("supernodes_config"):
+                            raise RuntimeError(
+                                f"Cannot place {self.runtime_args['required_nodes_num']} nodes "
+                                f"at {self.runtime_args['slots_per_node']} slots each in complete "
+                                "Pod groups with the current allocation and node health."
+                            )
                         raise RuntimeError(
                             "Bare-metal healthy nodes are fewer than required: "
                             f"{self.runtime_args['required_nodes_num']}"
@@ -248,6 +284,8 @@ class DistributedJobManager:
                 success, error_info = False, str(e)
 
             if success:
+                if self.runtime_args.get("supernodes_config"):
+                    self.ctx.node_pool_proxy.confirm_running_layout(self.runtime_args["slots_per_node"])
                 self.log_monitor.start()
                 return self.state_machine.on_train_success("start", node_list, error_info)
 

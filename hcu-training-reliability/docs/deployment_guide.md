@@ -41,9 +41,9 @@ hcu-cluster-inspect --help
 
 ## 3. 准备输入文件
 
-### 3.1 hostfile
+### 3.1 节点来源
 
-每行填写一个节点名。文件可以包含额外的 `slots=N` 字段，但节点池读取时只使用每行第一个字段：
+使用 `--supernodes` 时，裸机作业独占配置中展开的全部计算节点，Slurm 作业使用实际分配中的节点。使用 `--hostfile` 时，每行填写一个节点名。文件可以包含额外的 `slots=N` 字段，节点池读取每行第一个字段：
 
 ```text
 train-node-01 slots=8
@@ -90,7 +90,7 @@ Shell 解析器支持 `--parameter value` 形式。无法解析的变量表达�
 cp examples/start_none.sh start.local.sh
 vi start.local.sh
 bash -n start.local.sh
-bash start.local.sh
+bash start.local.sh --hostfile /path/to/hostfile
 ```
 
 关键配置：
@@ -103,7 +103,7 @@ export LOG_DIR=/path/to/training-logs
 export MEGATRON_SCRIPT_PATH=/path/to/train.sh
 ```
 
-裸机场景要求 `--nodes_num`、`--slots`、`--exec` 和 `--hostfile`，不要求 Job ID、Job Name 或 sbatch 脚本。
+裸机训练需要 `--nodes_num`、`--slots`、`--exec`，并显式选择 `--hostfile PATH` 或 `--supernodes [JSON]`。超节点模式的本地配置和启动示例见[配置指南](config_guide.md)。
 
 ## 5. Slurm allocation + MPI
 
@@ -113,7 +113,7 @@ export MEGATRON_SCRIPT_PATH=/path/to/train.sh
 cp examples/start_slurm.sh start.slurm.local.sh
 vi start.slurm.local.sh
 bash -n start.slurm.local.sh
-bash start.slurm.local.sh
+bash start.slurm.local.sh --hostfile /path/to/hostfile
 ```
 
 关键配置：
@@ -129,7 +129,7 @@ Slurm 场景额外要求 `--job_id`、`--job_name` 和 `--sbatch_script`。启�
 
 项目目录下的 `hcu-training-reliability/start.sh` 是现场配置模板，不是开箱即用脚本。使用前必须替换：
 
-- `LOG_DIR`、`TRIAN_PATH`、`RUN_PATH` 和 `HOSTFILE`。
+- `LOG_DIR`、`TRIAN_PATH` 和 `RUN_PATH`。调用脚本时传入节点来源参数。
 - 节点数和每节点进程数。
 - Conda 初始化脚本与环境名。
 - `nohup` 的 Python 路径和控制日志路径。

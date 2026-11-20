@@ -4,6 +4,42 @@
 
 set -euo pipefail
 
+# Check the source before nohup so conflicting arguments fail in the calling shell.
+hostfile_requested=false
+supernodes_requested=false
+cli_args=("$@")
+for i in "${!cli_args[@]}"; do
+    case "${cli_args[i]}" in
+        --hostfile)
+            hostfile_requested=true
+            hostfile_path="${cli_args[i+1]:-}"
+            ;;
+        --hostfile=*)
+            hostfile_requested=true
+            hostfile_path="${cli_args[i]#*=}"
+            ;;
+        --supernodes|--supernodes=*|--supernodes-config|--supernodes-config=*)
+            supernodes_requested=true
+            ;;
+    esac
+done
+if [[ "${hostfile_requested}" == "${supernodes_requested}" ]]; then
+    echo "Pass exactly one of --hostfile PATH or --supernodes [JSON]." >&2
+    exit 2
+fi
+if [[ "${hostfile_requested}" == true && -v SUPERNODES_CONFIG ]]; then
+    echo "Unset SUPERNODES_CONFIG to use --hostfile." >&2
+    exit 2
+fi
+if [[ "${hostfile_requested}" == true && -z "${hostfile_path:-}" ]]; then
+    echo "--hostfile requires a path." >&2
+    exit 2
+fi
+if [[ "${hostfile_requested}" == true && ! -r "${hostfile_path:-}" ]]; then
+    echo "Hostfile not found or unreadable: ${hostfile_path}" >&2
+    exit 2
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${WORK_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 LOG_DIR="${LOG_DIR:-${WORK_DIR}/logs}"
@@ -37,26 +73,17 @@ SLOTS="${SLOTS:-8}"
 # 仅用于 MPI/prterun 退出日志的故障节点映射，不控制训练节点数或 GPU 数。
 export MPI_RANKS_PER_NODE="${MPI_RANKS_PER_NODE:-${SLOTS}}"
 RUN_PATH="${RUN_PATH:-${DOCKER_EXEC_PATH:-/workspace/train/run.sh}}"
-HOSTFILE="${HOSTFILE:?Set HOSTFILE to the training hostfile}"
-if [[ ! -r "${HOSTFILE}" ]]; then
-    echo "Hostfile not found or unreadable: ${HOSTFILE}" >&2
-    exit 2
-fi
-# Resolve before changing into the project directory below.  A relative
-# HOSTFILE is supplied from the caller's directory, whereas main.py runs from
-# the project root.
-HOSTFILE="$(cd -- "$(dirname -- "${HOSTFILE}")" && pwd)/$(basename -- "${HOSTFILE}")"
-# Manually set the requested training node count; do not infer it from HOSTFILE.
+# Number of training nodes, excluding standby nodes.
 NODES_NUM="${NODES_NUM:-1}"
 
 mkdir -p "${LOG_DIR}"
-# Resolve after creation but before changing directories below.  This keeps an
-# explicitly relative LOG_DIR anchored to the directory from which the script
-# was invoked for both nohup redirection and the manager process.
 LOG_DIR="$(cd -- "${LOG_DIR}" && pwd)"
 export LOG_DIR
-cd "${SCRIPT_DIR}/.." || exit 1
-CLUSTER_MANAGER_MAIN="${CLUSTER_MANAGER_MAIN:-${SCRIPT_DIR}/../cluster_manager/main.py}"
+# Keep the caller's working directory for relative hostfile and JSON paths.
+CLUSTER_MANAGER_MAIN="${CLUSTER_MANAGER_MAIN:-cluster_manager/main.py}"
+if [[ "${CLUSTER_MANAGER_MAIN}" != /* ]]; then
+    CLUSTER_MANAGER_MAIN="${SCRIPT_DIR}/../${CLUSTER_MANAGER_MAIN}"
+fi
 if [[ ! -f "${CLUSTER_MANAGER_MAIN}" ]]; then
     echo "Cluster manager entrypoint not found: ${CLUSTER_MANAGER_MAIN}" >&2
     exit 2
@@ -66,4 +93,4 @@ nohup "${PYTHON_BIN}" "${CLUSTER_MANAGER_MAIN}" \
   --slots "${SLOTS}" \
   --mpi-ranks-per-node "${MPI_RANKS_PER_NODE}" \
   --exec "${RUN_PATH}" \
-  --hostfile "${HOSTFILE}" >> "${LOG_DIR}/cluster_manager.log" 2>&1 &
+  "$@" >> "${LOG_DIR}/cluster_manager.log" 2>&1 &

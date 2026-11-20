@@ -2,6 +2,38 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+# Check the source before nohup so conflicting arguments fail in the calling shell.
+hostfile_requested=false
+supernodes_requested=false
+cli_args=("$@")
+for i in "${!cli_args[@]}"; do
+    case "${cli_args[i]}" in
+        --hostfile)
+            hostfile_requested=true
+            hostfile_path="${cli_args[i+1]:-}"
+            ;;
+        --hostfile=*)
+            hostfile_requested=true
+            hostfile_path="${cli_args[i]#*=}"
+            ;;
+        --supernodes|--supernodes=*|--supernodes-config|--supernodes-config=*)
+            supernodes_requested=true
+            ;;
+    esac
+done
+if [[ "${hostfile_requested}" == "${supernodes_requested}" ]]; then
+    echo "Pass exactly one of --hostfile PATH or --supernodes [JSON]." >&2
+    exit 2
+fi
+if [[ "${hostfile_requested}" == true && -v SUPERNODES_CONFIG ]]; then
+    echo "Unset SUPERNODES_CONFIG to use --hostfile." >&2
+    exit 2
+fi
+if [[ "${hostfile_requested}" == true && -z "${hostfile_path:-}" ]]; then
+    echo "--hostfile requires a path." >&2
+    exit 2
+fi
+
 WORK_DIR=$(pwd)
 LOG_DIR="/path/to/logs"
 
@@ -26,16 +58,15 @@ export CLUSTER_SCHEDULE="${CLUSTER_SCHEDULE:-NONE}"
 
 TRIAN_PATH="/path/to/train.sh"
 export MEGATRON_SCRIPT_PATH="${TRIAN_PATH}"
-NODES_NUM=1024
-SLOTS=8
+NODES_NUM="${NODES_NUM:-1024}"
+SLOTS="${SLOTS:-8}"
 # 每节点 MPI 进程数，默认等于 SLOTS，适用于 MPI 直接启动各训练进程。
 # mpirun 每节点启动一个 torchrun 时必须改为 1：
-# MPI_RANKS_PER_NODE=1 bash start.sh
+# MPI_RANKS_PER_NODE=1 bash start.sh --supernodes
 # 仅用于 MPI/prterun 退出日志的故障节点映射，不控制训练节点数或 GPU 数。
 export MPI_RANKS_PER_NODE="${MPI_RANKS_PER_NODE:-${SLOTS}}"
 RUN_PATH="/path/to/run.sh"
 
-HOSTFILE="/path/to/hostfile"
 JOB_ID="${JOB_ID:-}"
 JOB_NAME="${JOB_NAME:-}"
 
@@ -48,7 +79,7 @@ nohup python /path/to/cluster-manager-das/hcu-training-reliability/cluster_manag
   --slots "${SLOTS}" \
   --mpi-ranks-per-node "${MPI_RANKS_PER_NODE}" \
   --exec "${RUN_PATH}" \
-  --hostfile "${HOSTFILE}" \
   --job_id "${JOB_ID}" \
   --job_name "${JOB_NAME}" \
-  --sbatch_script "${SBATCH_SCRIPT}" >> /path/to/logs/cluster0506.log 2>&1 &
+  --sbatch_script "${SBATCH_SCRIPT}" \
+  "$@" >> /path/to/logs/cluster0506.log 2>&1 &

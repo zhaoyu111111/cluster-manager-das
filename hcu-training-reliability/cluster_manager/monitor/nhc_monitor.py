@@ -6,7 +6,6 @@ import time
 import threading
 import dataclasses
 from typing import List, Dict, Any, Tuple, Optional
-from pathlib import Path
 from datetime import datetime, timedelta
 
 from cluster_manager.event.event_bus import Event, EventBus, EventType
@@ -14,9 +13,14 @@ from cluster_manager.config.global_config import logger
 from cluster_manager.platform.notify import Notify
 import cluster_manager.config.global_config as global_config
 from cluster_manager.launcher.fault_detection import FaultDetection
-from cluster_manager.node_management.node_pool import NodePool, NodePoolErrorCode
-from cluster_manager.utils.file_utils import read_hostfile, write_slotsfile
+from cluster_manager.node_management.node_pool import NodePool
+from cluster_manager.utils.file_utils import atomic_text_file, read_hostfile, write_ordered_hostfile
 from cluster_manager.node_management.node_blacklist_manager import BlacklistManager, BlacklistConfig, FaultType
+
+
+def _complete_probe(expected_nodes, passed_nodes, failed_nodes) -> bool:
+    passed, failed = set(passed_nodes), set(failed_nodes)
+    return passed.isdisjoint(failed) and (passed | failed) == set(expected_nodes)
 
 
 @dataclasses.dataclass
@@ -143,14 +147,15 @@ class NHCMonitor(threading.Thread):
                                     continue
 
                 # ===================== Step 1: NHC 检测 (每 NHC_CHECK_MULTIPLIER 轮) =====================
-                # self._enable_nhc_fault_handle = True 会检测但是不处理
                 if cycle % self.NHC_CHECK_MULTIPLIER == 0:
                     with self._proxy.pool_lock:
                         pool = self._proxy._node_pool
                         running_nodes_filepath = pool.running_nodes_filepath
                         running_nodes = set(pool.running_nodes)
 
-                        if running_nodes and running_nodes_filepath:
+                        if running_nodes and running_nodes_filepath and (
+                            pool.supernode_topology is None or self._proxy.current_snapshot
+                        ):
                             self._perform_nhc_check(running_nodes_filepath, running_nodes)
 
                 # ===================== Step 2: HCU 硬件信息检测 (每 HW_CHECK_MULTIPLIER 轮) =====================
@@ -199,7 +204,7 @@ class NHCMonitor(threading.Thread):
             return
 
         passed_nodes, failed_nodes, probe_ok = self.detector.run_nhc(running_filepath)
-        if not probe_ok:
+        if not probe_ok or not _complete_probe(running_nodes, passed_nodes, failed_nodes):
             logger.warning("[NodeCheckManager] NHC probe command failed, skip health-status update this cycle.")
             return
 
@@ -210,12 +215,16 @@ class NHCMonitor(threading.Thread):
         self._update_node_status(failed_nodes, "abnormal", now)
 
         if failed_nodes:
-            failed_nodes_reason = self.detector.run_nhc_nodes(failed_nodes)
-            self._notify_hcu_xid_faults(failed_nodes_reason)
+            try:
+                failed_nodes_reason = self.detector.run_nhc_nodes(failed_nodes)
+            except Exception:
+                logger.exception("[NodeCheckManager] Could not collect NHC fault details.")
+                failed_nodes_reason = {}
             if self._enable_nhc_fault_handle:
                 self._handle_faults(failed_nodes, running_nodes, failed_nodes_reason)
             else:
                 logger.info(f"[NodeCheckManager] NHC fault handle disabled by ENABLE_NHC_FAULT_HANDLE environment variable. Skipping _handle_faults for failed nodes: {failed_nodes}")
+            self._notify_hcu_xid_faults(failed_nodes_reason)
 
     def _notify_hcu_xid_faults(self, failed_nodes_reason: Optional[Dict[str, str]]):
         """Send Feishu alerts when NHC fault reason contains hcu_xid."""
@@ -247,7 +256,7 @@ class NHCMonitor(threading.Thread):
 
         message = "\n".join(message_lines)
         logger.warning(message)
-        self._notify.send_feishu_alert(message)
+        self._proxy._notify.send_feishu_alert(message)
 
     def _perform_hw_check(self, running_nodes: List[str]):
         """
@@ -544,23 +553,26 @@ class NHCMonitor(threading.Thread):
 
     def _handle_faults(self, failed_nodes: List[str], running_set: set,
                        failed_nodes_reason: Optional[Dict[str, str]] = None):
-        """处理故障节点：发布事件、更新快照（调用方必须已持有 pool_lock）"""
-        event = Event(type=EventType.NHC_MONITOR, payload={"type": "fault", "abnormal_nodes": failed_nodes})
-        self._event_bus.publish(event)
-
-        fault_in_running = set(failed_nodes) & running_set
-        if not fault_in_running:
+        """Quarantine confirmed running-node faults before asking the controller to stop."""
+        fault_list = [node for node in failed_nodes if node in running_set]
+        if not fault_list:
             return
 
-        fault_list = list(fault_in_running)
+        launched = list(self._proxy._node_pool.running_nodes)
+        changed, _, _, _ = self._proxy._node_pool.add_abnormal_nodes(fault_list)
+        if not changed:
+            return
         logger.warning(f"[NodeCheckManager] Detected FAULT in running nodes: {fault_list}")
 
         current_snap = self._proxy.current_snapshot
         if current_snap:
-            if failed_nodes_reason:
-                current_snap.fault_nodes.update(failed_nodes_reason)
+            current_snap.running_nodes = launched
+            reasons = failed_nodes_reason or {}
+            current_snap.fault_nodes.update({node: reasons.get(node, "NHC failed") for node in fault_list})
             current_snap.fault_count += 1
-            current_snap.running_nodes = list(self._proxy._node_pool.running_nodes)
+            self._proxy._persist_current_snapshot()
+        event = Event(type=EventType.NHC_MONITOR, payload={"type": "fault", "abnormal_nodes": fault_list})
+        self._event_bus.publish(event)
 
     def _append_to_json(self, file_path: str, data: Any):
         """追加写入 JSON 文件（JSONL 格式，调用方必须已持有 pool_lock）"""
@@ -707,6 +719,7 @@ class NodePoolProxy:
         self._slurm_mgr = slurm_mgr
         self._lock = threading.RLock()
         self.detector = FaultDetection()
+        self.detector.require_complete_nhc = node_pool.supernode_topology is not None
         # self.nodeblack = NodeBlacklist()
         self._event_bus = event_bus
         self._notify = Notify()
@@ -740,6 +753,13 @@ class NodePoolProxy:
         """NHCMonitor 通过此属性获取唯一的互斥锁，保证跨线程安全"""
         return self._lock
 
+    def _reset_slurm_pool(self, nodes):
+        isolated = []
+        if self._node_pool.supernode_topology is not None:
+            allocated = set(nodes)
+            isolated = [n for n in self._node_pool.abnormal_nodes if n in allocated]
+        self._node_pool.reset_node_pool(nodes, isolated)
+
     # =========================================================================
 
     # =========================================================================
@@ -770,10 +790,7 @@ class NodePoolProxy:
             if submitted:
                 logger.info("[Proxy] Job resubmitted successfully.")
                 submit_retry_count = 0
-                self._node_pool.reset_node_pool(
-                    total_nodes=read_hostfile(self._slurm_mgr.hostfile),
-                    abnormal_nodes=[]
-                )
+                self._reset_slurm_pool(read_hostfile(self._slurm_mgr.hostfile))
                 return True
 
             submit_retry_count += 1
@@ -794,13 +811,11 @@ class NodePoolProxy:
             finally:
                 self._lock.acquire()
 
-            count = self._slurm_mgr.get_job_node_count()
+            query_ok, nodes = self._slurm_mgr.get_job_nodes(verbose=False)
+            count = len(nodes) if query_ok else -1
             if count > 0:
                 logger.info(f"[Proxy] Job reappeared with {count} nodes after sleep.")
-                self._node_pool.reset_node_pool(
-                    total_nodes=read_hostfile(self._slurm_mgr.hostfile),
-                    abnormal_nodes=[]
-                )
+                self._reset_slurm_pool(nodes)
                 return True
 
             if count < 0:
@@ -810,14 +825,10 @@ class NodePoolProxy:
     # 原有方法
     # =========================================================================
 
-    def _try_load_additional_nodes(self):
+    def _try_load_additional_nodes(self, allocated_nodes=None):
         """
-        读取附加节点文件，NHC 检测通过后加入节点池（调用方必须已持有 self._lock）
-
-        修改：
-        1. 清空 additional_nodes.txt 文件（每次处理完就清空）
-        2. 将 passed 节点追加写入 succ_additional_nodes.txt（累积保存所有成功添加的节点）
-        3. succ_additional_nodes.txt 用于重启时与 hostfile 合并判断节点一致性
+        Probe requested additions under self._lock. In Slurm topology mode,
+        keep hosts pending until they belong to the current allocation.
         """
         additional_nodes_file = os.path.join(global_config.WORK_DIR, 'workspace/.node_pool/additional_nodes.txt')
         succ_additional_nodes_file = os.path.join(global_config.WORK_DIR, 'workspace/.node_pool/succ_additional_nodes.txt')
@@ -835,28 +846,27 @@ class NodePoolProxy:
         if not nodes:
             return []
 
-        # 去重
-        seen = set()
-        unique_nodes = []
-        for n in nodes:
-            if n not in seen:
-                unique_nodes.append(n)
-                seen.add(n)
+        if self._node_pool.supernode_topology is not None and self._slurm_mgr is not None:
+            if allocated_nodes is None:
+                query_ok, allocated_nodes = self._slurm_mgr.get_job_nodes(verbose=False)
+                if not query_ok:
+                    logger.warning("[Proxy] Cannot verify the Slurm allocation for additional nodes.")
+                    return []
+            allowed_nodes = set(allocated_nodes)
+            pending_nodes = list(dict.fromkeys(node for node in nodes if node not in allowed_nodes))
+            if pending_nodes:
+                logger.warning(f"[Proxy] Additional nodes awaiting Slurm allocation: {pending_nodes}")
+            nodes = [node for node in nodes if node in allowed_nodes]
 
-        # 清空 additional_nodes.txt（无论后续处理是否成功）
-        try:
-            with open(additional_nodes_file, 'w') as f:
-                pass  # 清空文件
-            logger.debug(f"[Proxy] Cleared additional_nodes.txt")
-        except Exception as e:
-            logger.error(f"[Proxy] Failed to clear additional_nodes.txt: {e}")
+        unique_nodes = list(dict.fromkeys(nodes))
 
-        passed = self.detector._run_nodes_nhc(unique_nodes, timeout=120)
+        if not unique_nodes:
+            return []
+        passed_set = set(self.detector._run_nodes_nhc(unique_nodes, timeout=120) or [])
+        passed = [node for node in unique_nodes if node in passed_set]
         if not passed:
             logger.warning(f"[Proxy] All {len(unique_nodes)} additional nodes failed NHC check.")
-            return []
-
-        actual_added = self._node_pool.add_total_nodes(passed)
+        actual_added = self._node_pool.add_total_nodes(passed) if passed else []
 
         # 将成功添加的节点追加写入 succ_additional_nodes.txt
         if actual_added:
@@ -880,6 +890,11 @@ class NodePoolProxy:
             except Exception as e:
                 logger.error(f"[Proxy] Failed to update succ_additional_nodes.txt: {e}")
 
+        # Operators can add names while NHC runs. Acknowledge only names we processed.
+        processed = set(unique_nodes)
+        pending_nodes = [node for node in read_hostfile(additional_nodes_file, preserve_order=True)
+                         if node not in processed]
+        write_ordered_hostfile(additional_nodes_file, pending_nodes)
         return actual_added or []
 
     def _persist_current_snapshot(self):
@@ -887,7 +902,7 @@ class NodePoolProxy:
         if self.current_snapshot:
             try:
                 data = dataclasses.asdict(self.current_snapshot)
-                with open(self.current_snapshot_file, 'w') as f:
+                with atomic_text_file(self.current_snapshot_file) as f:
                     json.dump(data, f, indent=4, default=str)
             except Exception as e:
                 logger.error(f"[Proxy] Failed to persist current snapshot: {e}")
@@ -938,229 +953,141 @@ class NodePoolProxy:
                     pass
 
 
-    # =========================================================================
-    # apply_node_num_resources：保持原始三分支语义，仅用 _resubmit_job 消除重复
-    # =========================================================================
+    def _recover_allocation_capacity(self, required, deficit, allocated_nodes):
+        """Keep the existing Slurm supplement/recovery loop; retry placement after it."""
+        count = (len(allocated_nodes) if allocated_nodes is not None
+                 else self._slurm_mgr.get_job_node_count())
+        if count < 0:
+            logger.warning("[Proxy] Slurm query failed; will retry allocation.")
+            return True
+        if count == 0:
+            self.release_runing_nodes()
+            return self._resubmit_job()
+
+        additional = self._try_load_additional_nodes(allocated_nodes)
+        recovered = []
+        abnormal = self._node_pool.abnormal_nodes
+        if count >= required and len(additional) < deficit and abnormal:
+            passed, failed, probe_ok = self.detector.run_nhc(self._node_pool.abnormal_nodes_filepath)
+            if probe_ok and _complete_probe(abnormal, passed, failed) and passed:
+                _, _, recovered = self._node_pool.add_normal_nodes(passed)
+        if len(additional) + len(recovered) < deficit:
+            self._notify.send_feishu_alert(
+                f"[节点补充] 作业需要{required}台，本轮补充{len(additional)}台、恢复{len(recovered)}台，"
+                "等待可用节点后重新分配。"
+            )
+        return True
+
     def apply_node_num_resources(self, required_num: int, slots_per_node: int) -> Tuple[Any, str]:
-        """
-        申请节点资源。
-
-        语义与原版完全一致：
-        - 分支1: 队列不存在 → 释放当前节点，重新提交
-        - 分支2: 队列节点不足 → 释放队列+当前节点，重新提交
-        - 分支3: 队列节点充足 → 恢复 abnormal 节点，actual_required_num = deficit（只补缺口）
-
-        锁顺序：持有 self._lock → 阻止 NHCMonitor 运行
-        """
-        self._required_num = required_num
-        submit_retry_interval = 180
-        submit_max_retries = 0
-        actual_required_num = required_num
-        retry_count = 0
-        need_apply = True
-
-
-
+        """Allocate a full launch layout and publish it only after every rank host passes NHC."""
+        pool = self._node_pool
+        topology_enabled = pool.supernode_topology is not None
+        candidate = None
+        retry = False
         while True:
-            if retry_count > 0:
+            if retry:
                 time.sleep(60)
-            retry_count += 1
+            retry = True
             with self._lock:
-                # ========== 从 NodePool 申请节点 ==========
-                if need_apply:
-                    result = self._node_pool.apply_node_num_resources(actual_required_num, slots_per_node)
-                    if result and result[1]:
-                        master_node, slots_file = result
-                        raw_nodes = list(self._node_pool.running_nodes)
-                    else:
-                        raw_nodes = []
-                else:
-                    # 复用当前轮已申请节点，不重新申请
-                    raw_nodes = list(self._node_pool.running_nodes)
-
-                if len(raw_nodes) < actual_required_num:
-                    deficit = actual_required_num - len(raw_nodes)
-                    logger.warning(
-                        f"[Proxy] Allocated {len(raw_nodes)} < required {actual_required_num}, deficit: {deficit}."
-                    )
-
-                    if self._slurm_mgr is None:
-                        logger.error(
-                            "[Proxy] Bare-metal healthy nodes are insufficient; "
-                            "skip Slurm recovery and fail immediately."
-                        )
-                        return None, None
-
-                    # ========== 检测队列状态 ==========
-                    queue_node_count = self._slurm_mgr.get_job_node_count()
-
-                    if queue_node_count < 0:
-                        logger.warning(
-                            f"[Proxy] Queue node count query failed ({queue_node_count}), "
-                            "skip allocation decision and retry next round."
-                        )
-                        need_apply=False
+                self._required_num = required_num
+                allocated = None
+                if topology_enabled and self._slurm_mgr is not None:
+                    query_ok, allocated = self._slurm_mgr.get_job_nodes(verbose=False)
+                    if not query_ok:
+                        logger.warning("[Proxy] Cannot verify the Slurm allocation; retrying.")
                         continue
-
-                    if queue_node_count == 0:
-                        # ========== 分支1: 队列不存在，重新提交 ==========
-                        logger.info(
-                            f"[Proxy] Queue node count: {queue_node_count}, required: {actual_required_num}. "
-                            f"Job NOT in queue, resubmitting..."
-                        )
+                    if not allocated:
                         self.release_runing_nodes()
-                        actual_required_num = required_num
-
-                        if not self._resubmit_job(submit_retry_interval, submit_max_retries):
+                        if not self._resubmit_job():
                             return None, None
-
+                        candidate = None
                         continue
+                    allowed = set(allocated)
+                    total = pool.total_nodes
+                    if not allowed.issuperset(total):
+                        self._reset_slurm_pool([node for node in total if node in allowed])
+                        candidate = None
 
-                    elif queue_node_count < actual_required_num:
-                        # ========== 分支2: 队列节点不足，直接补充节点 ==========
-                        logger.info(
-                            f"[Proxy] Queue node count: {queue_node_count}, required: {actual_required_num}. "
-                            f"Insufficient nodes, deficit: {deficit}, loading additional nodes..."
-                        )
-                        additional_nodes = self._try_load_additional_nodes()
-                        if len(additional_nodes) < deficit:
-                            self._notify.send_feishu_alert(
-                                f"[节点补充] 队列节点不足：队列{queue_node_count}个，"
-                                f"需要{actual_required_num}个，赤字{deficit}个，"
-                                f"补充{len(additional_nodes)}个仍不满足"
-                            )
-                        actual_required_num = deficit
-                        continue
-
-                    else:
-                        # ========== 分支3: 队列节点数足够，优先补充节点，不足再恢复异常节点 ==========
-                        logger.info(
-                            f"[Proxy] Queue node count: {queue_node_count}, required: {actual_required_num}. "
-                            f"Deficit: {deficit}."
-                        )
-
-                        # 先尝试补充节点
-                        additional_nodes = self._try_load_additional_nodes()
-                        if len(additional_nodes) >= deficit:
-                            logger.info(
-                                f"[Proxy] Additional nodes enough: {len(additional_nodes)} >= deficit {deficit}."
-                            )
-                            actual_required_num = deficit
-                            continue
-
-                        # 补充节点不够，再尝试恢复异常节点
-                        remaining_deficit = deficit - len(additional_nodes)
-                        logger.info(
-                            f"[Proxy] Additional nodes insufficient: {len(additional_nodes)}, "
-                            f"remaining deficit: {remaining_deficit}, checking abnormal nodes for recovery..."
-                        )
-                        abnormal_nodes_filepath = self._node_pool.abnormal_nodes_filepath
-                        recovered_nodes = []
-                        if abnormal_nodes_filepath:
-                            recovered_nodes, still_faulty_nodes, recovery_probe_ok = self.detector.run_nhc(abnormal_nodes_filepath)
-                            if not recovery_probe_ok:
-                                logger.warning("[Proxy] NHC recovery probe failed, skip abnormal-node recovery in this round.")
-                            elif recovered_nodes:
-                                logger.info(
-                                    f"[Proxy] {len(recovered_nodes)} abnormal nodes recovered: {recovered_nodes}"
-                                )
-                                self._node_pool.add_normal_nodes(recovered_nodes)
-                            if recovery_probe_ok and still_faulty_nodes:
-                                logger.warning(
-                                    f"[Proxy] {len(still_faulty_nodes)} abnormal nodes still faulty."
-                                )
+                running = list(pool.running_nodes)
+                if candidate is None or running != candidate:
+                    # The topology planner needs the entire ordered group on every retry.
+                    # Legacy pools append newly allocated nodes to any running ones.
+                    request = required_num if topology_enabled else required_num - len(running)
+                    if request > 0:
+                        result = pool.apply_node_num_resources(request, slots_per_node)
+                        if result and result[1]:
+                            slots_file = result[1]
+                            running = list(pool.running_nodes)
                         else:
-                            logger.warning("[Proxy] No abnormal nodes available for recovery.")
-
-                        # 补充 + 恢复仍不满足赤字，飞书告警
-                        if len(additional_nodes) + len(recovered_nodes) < deficit:
-                            self._notify.send_feishu_alert(
-                                f"[节点补充] 补充节点{len(additional_nodes)}个 + 恢复节点{len(recovered_nodes)}个"
-                                f" = {len(additional_nodes) + len(recovered_nodes)}个，"
-                                f"仍不满足赤字{deficit}个"
-                            )
-
-                        actual_required_num = deficit
-                        continue
-                # ========== NHC 健康检查 ==========
-                healthy_nodes, faulty_nodes, probe_ok = self.detector.run_nhc(self._node_pool.running_nodes_filepath)
-                if not probe_ok:
-                    logger.warning("[Proxy] NHC pre-apply probe failed, health result unknown. Retry allocation in next round.")
-                    need_apply = False
-                    continue
-
-                if faulty_nodes:
-                    logger.warning(f"[Proxy] Found {len(faulty_nodes)} faulty nodes during pre-apply check.")
-                    need_apply = True
-                    # 调用 add_abnormal_nodes 并获取返回值
-                    result = self._node_pool.add_abnormal_nodes(faulty_nodes)
-                    logger.info(f'>= NHC check result:{result}')
-                    # 检查是否触发了运行中节点冲突
-                    # add_abnormal_nodes 返回: (has_valid, has_cleared_running, valid_nodes, conflict_nodes)
-                    if result and len(result) >= 2 and result[1]:
-                        # 运行中节点被清空，需要重新申请完整数量
-                        logger.warning(
-                            f"[Proxy] Running nodes cleared due to fault in running nodes. "
-                            f"Re-requesting full amount: {required_num}"
-                        )
-                        actual_required_num = required_num
-                        continue
-
-                    if required_num == len(faulty_nodes) and self._slurm_mgr is not None:
-                        queue_count = self._slurm_mgr.get_job_node_count()
-                        if queue_count < 0:
-                            logger.warning(
-                                f"[Proxy] Queue node count query failed ({queue_count}) during NHC pre-apply check, retry."
-                            )
+                            candidate = None
+                            if self._slurm_mgr is None:
+                                logger.error(f"[Proxy] No complete bare-metal layout for {required_num} nodes.")
+                                return None, None
+                            deficit = max(1, required_num - len(running))
+                            if not self._recover_allocation_capacity(required_num, deficit, allocated):
+                                return None, None
                             continue
-                        if queue_count == 0:
-                            logger.warning("[Proxy] Queue gone during NHC check.")
-                            actual_required_num = required_num
-                            continue
-
-
-                    actual_required_num = required_num - len(healthy_nodes)
-                    if self._slurm_mgr is None and actual_required_num > 0:
-                        logger.error(
-                            "[Proxy] Bare-metal healthy nodes are insufficient after NHC; "
-                            "fail immediately."
-                        )
+                    elif request == 0:
+                        slots_file = pool.slots_filepath
+                    if len(running) != required_num or len(set(running)) != required_num or not running:
+                        logger.error("[Proxy] Node pool returned an inconsistent launch layout.")
                         return None, None
-                    logger.info(f'=> 故障节点 {faulty_nodes} 添加到黑名单中 <=')
-                    for node_fail in faulty_nodes:
-                        self.bl_mgr.report_fault(node_fail, FaultType.HCU, description="apply_node_num_resources 申请节点时，执行run_nhc 未通过")
-                    if actual_required_num <= 0:
-                        logger.info(f"[Proxy] Successfully applied {required_num} healthy nodes.")
-                        write_slotsfile(slots_file, healthy_nodes)
-                        self.current_snapshot = NodeSnapshot(
-                            apply_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            running_nodes=list(healthy_nodes),
-                            fault_nodes={},
-                            fault_count=0
-                        )
-                        self._persist_current_snapshot()
-                        return healthy_nodes[0], slots_file
+                    candidate = running.copy()
 
+                if topology_enabled:
+                    # Initial placement checks every local standby as well as the active hosts.
+                    # Recovery is allowed to use the remaining capacity of the selected Pods.
+                    probe_nodes, probe_file = pool.nhc_probe_layout()
+                    if not set(candidate).issubset(probe_nodes):
+                        logger.error("[Proxy] Incomplete node pool NHC hostfile for the planned launch.")
+                        return None, None
+                    if not set(probe_nodes).isdisjoint(pool.abnormal_nodes):
+                        pool.release_runing_nodes()
+                        candidate = None
+                        continue
+                else:
+                    probe_nodes, probe_file = candidate, pool.running_nodes_filepath
+                passed, failed, probe_ok = self.detector.run_nhc(probe_file)
+                if not probe_ok or not _complete_probe(probe_nodes, passed, failed):
+                    logger.warning("[Proxy] Incomplete NHC response; will probe the same layout again.")
+                    continue
+                if failed:
+                    changed, cleared, _, _ = pool.add_abnormal_nodes(failed)
+                    if changed:
+                        if topology_enabled and not cleared:
+                            # A standby-only fault also invalidates the initial reservation.
+                            pool.release_runing_nodes()
+                        for node in failed:
+                            self.bl_mgr.report_fault(node, FaultType.HCU, description="Pre-launch NHC failed")
+                        candidate = None
+                        retry = False
                     continue
 
-                # 全部健康，返回
-                if not healthy_nodes:
-                    logger.warning(
-                        "[Proxy] NHC probe succeeded but healthy node list is empty, skip returning slots and retry."
-                    )
-                    actual_required_num = required_num
-                    continue
-                logger.info(f"[Proxy] Successfully applied {required_num} healthy nodes.")
-                write_slotsfile(slots_file, healthy_nodes)
+                # NHC reports by health/result group. NodePool's order defines ranks.
+                if topology_enabled:
+                    slots_file = pool.slots_filepath
+                write_ordered_hostfile(slots_file, candidate, slots_per_node)
                 self.current_snapshot = NodeSnapshot(
                     apply_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    running_nodes=list(healthy_nodes),
-                    fault_nodes={},
-                    fault_count=0
+                    running_nodes=candidate.copy(),
                 )
                 self._persist_current_snapshot()
-                return healthy_nodes[0], slots_file
+                logger.info(f"[Proxy] Allocated {required_num} healthy nodes with {slots_per_node} slots each.")
+                return candidate[0], slots_file
 
+    def restore_legacy_layout(self, slots):
+        """Align an older NHC snapshot with the slot order of the live training job."""
+        with self._lock:
+            self._node_pool.restore_legacy_layout(slots)
+            running = list(self._node_pool.running_nodes)
+            if self.current_snapshot and running and set(self.current_snapshot.running_nodes) == set(running):
+                self.current_snapshot.running_nodes = running
+                self._persist_current_snapshot()
+
+    def confirm_running_layout(self, slots):
+        """Record the recovery baseline only after the launcher accepts the layout."""
+        with self._lock:
+            return self._node_pool.confirm_running_layout(slots)
 
     def release_runing_nodes(self):
         """释放当前运行节点（持有 self._lock → 阻止 NHCMonitor 运行）"""
@@ -1172,7 +1099,8 @@ class NodePoolProxy:
 
             if self.current_snapshot:
                 self.current_snapshot.release_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.current_snapshot.running_nodes = nodes_to_release
+                if nodes_to_release:
+                    self.current_snapshot.running_nodes = nodes_to_release
                 self.last_snapshot = self.current_snapshot
 
                 release_time_str = str(self.current_snapshot.release_time)
@@ -1276,6 +1204,7 @@ class NodePoolProxy:
         """
         with self._lock:
             logger.error(f"[Fault Mark] Nodes to check: {fault_nodes}")
+            fault_node_reasons = {node: "Fault reported" for node in fault_nodes}
             try:
                 if fault_reason:
                     # 直接使用传入的故障原因
@@ -1298,7 +1227,7 @@ class NodePoolProxy:
                     logger.info(f'>= fault_node_reasons:{fault_node_reasons}')
                 else:
                     # 通过 NHC 检测获取故障详情
-                    fault_node_reasons: Dict[str, str] = self.detector.run_nhc_nodes(fault_nodes)
+                    fault_node_reasons.update(self.detector.run_nhc_nodes(fault_nodes))
                     logger.error(f"[Fault Mark] NHC detection result: {fault_node_reasons}")
                     for node_name, log_content in fault_node_reasons.items():
                         logger.error(f'>= log_content:{log_content}')
@@ -1323,12 +1252,14 @@ class NodePoolProxy:
                 logger.exception(f'>= 报错{e} <=')
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._check_manager._update_node_status(fault_nodes, "abnormal", now, source="manual_fault")
+            launched = list(self._node_pool.running_nodes)
             self._node_pool.add_abnormal_nodes(fault_nodes)
             logger.error(f"[Fault Mark] Node status updated to 'abnormal': {fault_nodes}")
             if self.current_snapshot:
+                if launched:
+                    self.current_snapshot.running_nodes = launched
                 self.current_snapshot.fault_nodes.update(fault_node_reasons)
                 self.current_snapshot.fault_count += 1
-                self.current_snapshot.running_nodes = list(self._node_pool.running_nodes)
                 self._persist_current_snapshot()
 
     def add_fault_nodes_no(self, fault_nodes_no, fault_reason: Dict = None):
@@ -1341,18 +1272,14 @@ class NodePoolProxy:
         """
         if fault_nodes_no is None:
             return
-        fault_nodes = []
         with self._lock:
+            # Quarantining a running node clears the live list. More rank errors
+            # from this attempt must still resolve against the original launch.
             running = self._node_pool.running_nodes
-            try:
-                if fault_nodes_no < len(running):
-                    node = running[fault_nodes_no]
-                    fault_nodes.append(node)
-            except Exception as e:
-                logger.exception(f'>= 报错:{e}')
-
-        if fault_nodes:
-            return self.add_fault_nodes(fault_nodes, fault_reason=fault_reason)
+            if not running and self.current_snapshot:
+                running = self.current_snapshot.running_nodes
+            if isinstance(fault_nodes_no, int) and 0 <= fault_nodes_no < len(running):
+                return self.add_fault_nodes([running[fault_nodes_no]], fault_reason=fault_reason)
         return False
 
     def add_current_snapshot_param(self, **kwargs: Any):

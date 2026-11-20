@@ -76,6 +76,7 @@ setuptools.setup(
 
     packages=setuptools.find_packages(exclude=("test", "test.*")),
 
+    package_data={"cluster_manager.config": ["supernodes.json"]},
     include_package_data=True,
     zip_safe=False,
     keywords=__keywords__,

@@ -8,6 +8,7 @@ import sys
 from collections import defaultdict
 from cluster_manager.config.global_config import logger
 from cluster_manager.node_management.hostfile_handler import HostfileHandler
+from cluster_manager.utils.file_utils import read_hostfile, write_ordered_hostfile
 from cluster_manager.utils.string_utils import compress_nodes
 from cluster_manager.node_management.node_blacklist_manager import BlacklistManager, BlacklistConfig, AllocationResult
 from cluster_manager.config.global_config import BLACKLIST_PERSISTENCE_PATH, BLACKLIST_PERSISTENCE_BACKUP_PATH
@@ -43,10 +44,15 @@ class NodePool:
     5. 冲突处理规则：新增异常节点含运行中节点 → 返回错误码1001 + 清空运行中节点
     """
 
+    supernode_topology = None
+
     def __init__(
         self,
         pool_root_path: Union[str, Path],
         hostfile,
+        topology=None,
+        *,
+        restore_additional=True,
     ):
         """
         初始化节点池（自动校验约束，确保初始状态符合所有规则）
@@ -61,6 +67,8 @@ class NodePool:
             self._root_path = Path(pool_root_path).resolve()
             self._node_pool_path: Optional[Path] = None
             self._init_storage_path()
+            self.supernode_topology = topology
+            self._restore_additional = restore_additional
 
             # ------------------------------ 2. 定义各节点类型的文件路径成员变量 ------------------------------
             self.total_nodes_filepath: Path = self._node_pool_path / "total_nodes.txt"
@@ -69,6 +77,12 @@ class NodePool:
             self.abnormal_nodes_filepath: Path = self._node_pool_path / "abnormal_nodes.txt"
             self.normal_nodes_filepath: Path = self._node_pool_path / "normal_nodes.txt"
             self.slots_filepath: Path = self._node_pool_path / "slots_nodes.txt"
+            self._candidate_slots_path = self._node_pool_path / "candidate_slots.txt"
+            self._probe_nodes_path = self._node_pool_path / "probe_nodes.txt"
+            self._probe_nodes = []
+            self._candidate_layout = None
+            self._confirmed_slots_path = self._node_pool_path / "confirmed_slots.txt"
+            self._confirmed_dirty = False
             self.additional_nodes_filepath: Path = self._node_pool_path / "additional_nodes.txt"
             # ------------------------------ 3. 创建所有节点文件 ------------------------------
             self._create_node_files()
@@ -90,6 +104,9 @@ class NodePool:
             # ------------------------------ 4. 初始化核心成员变量 ------------------------------
             self._total_nodes = self._deduplicate_and_sort(HostfileHandler.read(hostfile) or []  )
             self._check_and_sync_total_nodes()
+            if topology is not None:
+                topology.validate_hosts(self._total_nodes)
+                self._confirmed_nodes, self._confirmed_slots = self._read_layout(self._confirmed_slots_path)
             logger.info(f"total_nodes:{compress_nodes(self._total_nodes)} num:{len(self._total_nodes)}")
             logger.info(f"run_nodes:{compress_nodes(self._running_nodes)} num:{len(self._running_nodes)}")
             logger.info(f"backup_nodes:{compress_nodes(self._backup_nodes)} num:{len(self._backup_nodes)}")
@@ -107,7 +124,7 @@ class NodePool:
             sys.exit(1)
 
     @classmethod
-    def clean_init(cls, pool_root_path: Union[str, Path], hostfile):
+    def clean_init(cls, pool_root_path: Union[str, Path], hostfile, topology=None):
         """
         干净初始化：先删除已有的持久化文件，再初始化节点池。
         用于测试或重置场景。
@@ -122,7 +139,7 @@ class NodePool:
             logger.info(f"已删除持久化目录: {pool_path}")
         # 重置黑名单管理器单例，确保干净初始化
         BlacklistManager.reset_instance()
-        return cls(pool_root_path, hostfile)
+        return cls(pool_root_path, hostfile, topology=topology)
     
     # ------------------------------ 内部辅助函数（私有，仅类内部调用） ------------------------------
     def _check_and_sync_total_nodes(self):
@@ -146,6 +163,21 @@ class NodePool:
             # 2. 内存中的总节点（已在 __init__ 中去重排序，来自 hostfile）
             mem_nodes = self._total_nodes
             self._last_running_nodes = []
+
+            if self.supernode_topology is not None:
+                # An externally supplied scheduler allocation is a hard limit.
+                # In bare-metal mode successful hot additions survive a restart.
+                additional = self._node_pool_path / "succ_additional_nodes.txt"
+                if self._restore_additional and mem_nodes != file_nodes_sorted and additional.exists():
+                    combined = set(mem_nodes).union(HostfileHandler.read(additional))
+                    if combined == set(file_nodes_sorted):
+                        self._total_nodes = file_nodes_sorted
+                self._abnormal_nodes = self._filter_nodes_in_total(HostfileHandler.read(self.abnormal_nodes_filepath))
+                self._sync_normal_nodes()
+                running = read_hostfile(self.running_nodes_filepath, preserve_order=True)
+                self._running_nodes = running if set(running).issubset(self._normal_nodes) else []
+                self._sync_backup_nodes()
+                return
             
             # 3. 对比一致性
             if mem_nodes == file_nodes_sorted:
@@ -156,7 +188,7 @@ class NodePool:
                     f"num:{len(mem_nodes)} {compress_nodes(mem_nodes)}"
                 )
                 self._abnormal_nodes = HostfileHandler.read(self.abnormal_nodes_filepath)
-                self._running_nodes = HostfileHandler.read(self.running_nodes_filepath)
+                self._running_nodes = read_hostfile(self.running_nodes_filepath, preserve_order=True)
                 self._normal_nodes = HostfileHandler.read(self.normal_nodes_filepath)
                 self._backup_nodes = HostfileHandler.read(self.backup_nodes_filepath)
             elif not file_nodes_sorted:
@@ -189,7 +221,7 @@ class NodePool:
                     )
                     self._total_nodes = file_nodes_sorted
                     self._abnormal_nodes = HostfileHandler.read(self.abnormal_nodes_filepath)
-                    self._running_nodes = HostfileHandler.read(self.running_nodes_filepath)
+                    self._running_nodes = read_hostfile(self.running_nodes_filepath, preserve_order=True)
                     self._normal_nodes = HostfileHandler.read(self.normal_nodes_filepath)
                     self._backup_nodes = HostfileHandler.read(self.backup_nodes_filepath)
                     logger.info(
@@ -221,6 +253,95 @@ class NodePool:
             ) from e
         except Exception as e:
             raise RuntimeError(f"校验并同步总节点失败：{str(e)}") from e
+
+    @staticmethod
+    def _read_layout(path):
+        """Load exact rank order and the common slot count from a placement file."""
+        if not path.exists():
+            return [], None
+        hosts = []
+        slots = None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            fields = line.split()
+            if len(fields) != 2 or not fields[1].startswith("slots="):
+                raise ValueError(f"Invalid slotfile row in {path}: {line!r}")
+            width = int(fields[1][6:])
+            if width < 1 or (slots is not None and width != slots):
+                raise ValueError(f"Inconsistent slot counts in {path}")
+            slots = width
+            hosts.append(fields[0])
+        if len(hosts) != len(set(hosts)):
+            raise ValueError(f"Duplicate rank hosts in {path}")
+        return hosts, slots
+
+    def clear_confirmed_layout(self):
+        """A fresh job must meet initial standby capacity even in a reused workspace."""
+        if self.supernode_topology is None:
+            return
+        with self._lock:
+            write_ordered_hostfile(self._confirmed_slots_path, [])
+            self._confirmed_nodes, self._confirmed_slots = [], None
+            self._confirmed_dirty = False
+
+    def _flush_confirmed_layout(self):
+        if self._confirmed_dirty:
+            try:
+                write_ordered_hostfile(self._confirmed_slots_path, self._confirmed_nodes, self._confirmed_slots)
+            except OSError:
+                logger.exception("Cannot persist the launched Pod layout; keeping it in memory for retry")
+            else:
+                self._confirmed_dirty = False
+
+    def _remember_confirmed_layout(self, hosts, slots):
+        self._confirmed_nodes, self._confirmed_slots = hosts.copy(), slots
+        self._confirmed_dirty = True
+        self._flush_confirmed_layout()
+
+    def restore_legacy_layout(self, slots):
+        """Recover the published order only when the controller has found a live job."""
+        if self.supernode_topology is None:
+            return
+        with self._lock:
+            has_candidate = self._candidate_slots_path.exists()
+            try:
+                hosts, width = self._read_layout(self.slots_filepath)
+                if has_candidate:
+                    if (hosts, width) != self._read_layout(self._candidate_slots_path):
+                        return
+                elif self._confirmed_slots_path.exists():
+                    return
+            except (ValueError, OSError) as error:
+                logger.warning("Cannot verify the launched slotfile order: %s", error)
+                return
+            if not hosts or set(hosts) != set(self._running_nodes):
+                return
+            # Even older jobs that cannot be resumed with this topology still
+            # need the actual launched rank order for current fault reporting.
+            if self._running_nodes != hosts:
+                self._running_nodes = hosts.copy()
+                write_ordered_hostfile(self.running_nodes_filepath, hosts)
+            if width != slots:
+                logger.warning("Launched slotfile width %s differs from configured slots %s", width, slots)
+                return
+            try:
+                self.supernode_topology.validate_layout(hosts, slots, initial=not has_candidate)
+            except ValueError as error:
+                logger.warning("Launched placement cannot serve as a Pod recovery layout: %s", error)
+                return
+            if (hosts, slots) != (self._confirmed_nodes, self._confirmed_slots):
+                self._remember_confirmed_layout(hosts, slots)
+
+    def confirm_running_layout(self, slots):
+        """Checkpoint the candidate actually launched, even if a concurrent fault released it."""
+        if self.supernode_topology is None:
+            return
+        with self._lock:
+            hosts, width = self._candidate_layout or self._read_layout(self._candidate_slots_path)
+            if not hosts or width != slots:
+                raise ValueError("Cannot confirm a missing candidate or a different slot width")
+            self._remember_confirmed_layout(hosts, slots)
         
     def _deduplicate_and_sort(self, nodes: List[str]) -> List[str]:
         """
@@ -263,6 +384,8 @@ class NodePool:
                 candidate_nodes, required_count=len(candidate_nodes)
             )
         except Exception as e:
+            if self.supernode_topology is not None:
+                raise RuntimeError("Cannot plan a Pod allocation without blacklist status") from e
             logger.error(f"黑名单查询异常，跳过黑名单过滤: {e}")
             return candidate_nodes.copy(), [], []
 
@@ -497,6 +620,16 @@ class NodePool:
             ("normal_nodes", self._normal_nodes, self.normal_nodes_filepath),
         ]
 
+        if self.supernode_topology is not None:
+            self._flush_confirmed_layout()
+            # Quarantine must reach disk before clearing a failed running
+            # layout. Restore reconstructs normal and standby from these facts.
+            node_data_path_map.sort(key=lambda item: item[0] != "abnormal_nodes")
+            for _, nodes, file_path in node_data_path_map:
+                write_ordered_hostfile(file_path, nodes)
+                success_paths.append(file_path)
+            return success_paths
+
         for node_type, nodes, file_path in node_data_path_map:
             try:
                 # 写入文件（空列表会写入空文件，符合持久化逻辑）
@@ -593,24 +726,23 @@ class NodePool:
 
             logger.warning("[NodePool] Reset node pool")
 
-            # ---------- 更新 total ----------
-            self._total_nodes = self._deduplicate_and_sort(total_nodes)
-
-            # ---------- 清空运行状态 ----------
-            self._running_nodes = []
-            self._last_running_nodes = []
-
-            # ---------- 更新 abnormal ----------
-            self._abnormal_nodes = self._deduplicate_and_sort(abnormal_nodes or [])
-
-            # ---------- 校验 ----------
-            abnormal_set = set(self._abnormal_nodes)
-            total_set = set(self._total_nodes)
+            updated_total = self._deduplicate_and_sort(total_nodes)
+            total_set = set(updated_total)
+            abnormal_set = set(self._deduplicate_and_sort(abnormal_nodes or []))
+            if self.supernode_topology is not None:
+                self.supernode_topology.validate_hosts(updated_total)
+                # A new Slurm allocation alone does not clear quarantine.
+                abnormal_set.update(total_set.intersection(self._abnormal_nodes))
             invalid = abnormal_set - total_set
             if invalid:
                 raise ValueError(
                     f"abnormal nodes not in total_nodes: {invalid}"
                 )
+
+            self._total_nodes = updated_total
+            self._abnormal_nodes = sorted(abnormal_set)
+            self._running_nodes = []
+            self._last_running_nodes = []
 
             # ---------- 重新计算 normal ----------
             self._sync_normal_nodes()
@@ -651,11 +783,14 @@ class NodePool:
                 logger.info("添加总节点：无新增有效节点（已存在或无效）")
                 return None
 
+            if self.supernode_topology is not None:
+                self.supernode_topology.validate_hosts(new_total_nodes)
             # 核心操作：添加到总节点 + 自动分配至备用节点
             self._total_nodes.extend(new_total_nodes)
             self._total_nodes = self._deduplicate_and_sort(self._total_nodes)
             self._backup_nodes.extend(new_total_nodes)
             self._backup_nodes = self._deduplicate_and_sort(self._backup_nodes)
+            self._sync_normal_nodes()
 
             # 校验约束 + 同步正常节点
             self._validate_and_fix_constraints()
@@ -735,6 +870,8 @@ class NodePool:
             input_nodes = [nodes] if isinstance(nodes, str) else nodes
 
             # 步骤1：校验节点合法性
+            if self.supernode_topology is not None:
+                input_nodes = set(input_nodes).difference(self._abnormal_nodes)
             valid_nodes, err_code = self._validate_abnormal_candidates(input_nodes)
             if err_code != NodePoolErrorCode.SUCCESS:
                 return False, False, None, None
@@ -749,8 +886,8 @@ class NodePool:
                 # 触发冲突处理：返回错误码 + 清空运行中节点
                 logger.error(f"冲突触发：新增异常节点包含运行中节点 → {sorted(runing_conflict_nodes)}")
                 has_cleared_running = True
-                self._last_running_nodes.clear()
-                self._last_running_nodes = self._running_nodes.copy()
+                if self.supernode_topology is None:
+                    self._last_running_nodes = self._running_nodes.copy()
                 self._running_nodes.clear()
 
             # # 备用节点列表移除
@@ -835,6 +972,9 @@ class NodePool:
         with self._lock:
             logger.debug(f'>= remove_ab_nodes <=')
             # 步骤1：校验目标池合法性
+            if target_pool == "running" and self.supernode_topology is not None:
+                logger.error("Recovered Pod nodes must rejoin standby before placement")
+                return NodePoolErrorCode.INVALID_TARGET_POOL, False
             if target_pool not in ["backup", "running"]:
                 logger.error(f"恢复异常节点失败：无效目标池 → {target_pool}（仅支持 backup/running）")
                 return NodePoolErrorCode.INVALID_TARGET_POOL, False
@@ -871,7 +1011,9 @@ class NodePool:
                 self._backup_nodes = self._deduplicate_and_sort(self._backup_nodes)
 
             # 步骤5：校验约束 + 同步正常节点
+            self._sync_normal_nodes()
             self._validate_and_fix_constraints()
+            self._persist_all_nodes()
 
             # 步骤6：日志输出 + 返回结果
             logger.info(f"恢复异常节点成功：{len(valid_nodes)} 个 → {sorted(valid_nodes)}")
@@ -945,6 +1087,40 @@ class NodePool:
         }
     
     # ------------------------------ 扩展功能接口（运行中节点管理，符合之前规则） ------------------------------
+    def nhc_probe_layout(self):
+        """Return the ordered hosts to qualify before publishing this launch."""
+        with self._lock:
+            return self._probe_nodes.copy(), self._probe_nodes_path
+
+    def _apply_supernode_resources(self, count, slots, targets=None):
+        """Reserve a complete ordered candidate under the pool lock."""
+        self._flush_confirmed_layout()
+        healthy, degraded, _ = self._get_available_nodes_with_blacklist(self._normal_nodes)
+        recovering = self._confirmed_slots == slots and len(self._confirmed_nodes) == count
+        if targets is None:
+            baseline = self._confirmed_nodes if recovering else []
+        else:
+            baseline = targets
+            recovering = recovering and targets == self._confirmed_nodes
+        layout = self.supernode_topology.plan(
+            count, slots, baseline, healthy, degraded, initial=not recovering
+        )
+        if layout is None:
+            return None, None
+
+        # Initial capacity includes this job's local spares. Recovery can
+        # consume those spares and only has to qualify the resulting ranks.
+        probe_hosts = layout if recovering else self.supernode_topology.pod_hosts_for(layout)
+        write_ordered_hostfile(self._probe_nodes_path, probe_hosts)
+        write_ordered_hostfile(self._candidate_slots_path, layout, slots)
+        self._running_nodes = layout
+        self._sync_backup_nodes()
+        self._validate_and_fix_constraints()
+        self._persist_all_nodes()
+        self._probe_nodes = probe_hosts
+        self._candidate_layout = layout.copy(), slots
+        return layout[0], self._candidate_slots_path
+
     def apply_node_num_resources(self, nodes_num, slots):
         """
         从备用节点中分配指定数量的节点到运行节点（集成黑名单过滤）
@@ -960,6 +1136,8 @@ class NodePool:
         :return: (第一个运行节点名称, slots文件路径)；分配失败返回 (None, None)
         """
         with self._lock:
+            if self.supernode_topology is not None:
+                return self._apply_supernode_resources(nodes_num, slots)
             # ======== 黑名单过滤：将备用节点分为健康、降级、致命三组 ========
             healthy_backup, degraded_backup, rejected_backup = self._get_available_nodes_with_blacklist(
                 self._backup_nodes
@@ -1173,6 +1351,8 @@ class NodePool:
             if not isinstance(target_nodes, list) or len(target_nodes) == 0:
                 logger.error(f"目标节点列表无效：必须是非空列表，当前输入：{target_nodes}")
                 return None, None
+            if self.supernode_topology is not None:
+                return self._apply_supernode_resources(len(target_nodes), slots, target_nodes)
             
             # ======== 黑名单过滤备用节点 ========
             healthy_backup, degraded_backup, rejected_backup = self._get_available_nodes_with_blacklist(
@@ -1263,8 +1443,8 @@ class NodePool:
         with self._lock:
             self._backup_nodes = self._deduplicate_and_sort(list(set(self._running_nodes) | set(self._backup_nodes)))
             if self._running_nodes:
-                self._last_running_nodes.clear()
-                self._last_running_nodes = self._running_nodes.copy()
+                if self.supernode_topology is None:
+                    self._last_running_nodes = self._running_nodes.copy()
                 self._running_nodes.clear()
                 self._persist_all_nodes()
     

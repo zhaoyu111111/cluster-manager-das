@@ -9,13 +9,16 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 1. 训练命令行参数
 
+裸机和 Slurm 训练都必须在命令行显式选择一种节点来源。仅设置环境变量 `SUPERNODES_CONFIG`、同时传入两种来源或两种都未传，都会报错。使用 `--hostfile` 前，如已设置 `SUPERNODES_CONFIG`，请执行 `unset SUPERNODES_CONFIG`。
+
 | 参数 | 裸机 | Slurm | 说明 |
 |---|---:|---:|---|
 | `--nodes_num` | 必填 | 必填 | 每轮训练需要的节点数，必须大于 0 |
 | `--slots` | 必填 | 必填 | 每个节点的训练进程数，必须大于 0 |
 | `--mpi-ranks-per-node` | 可选 | 可选 | 训练脚本中每节点的 MPI 进程数；也可用 `MPI_RANKS_PER_NODE` 设置，命令行优先。MPI 退出后备定位需要此配置 |
 | `--exec` | 必填 | 必填 | 训练启动 Shell 脚本；必须存在且可读 |
-| `--hostfile` | 必填 | 必填 | 节点列表；Slurm 模式启动后会按 allocation 更新 |
+| `--hostfile PATH` | 二选一 | 二选一 | 使用普通节点池。hostfile 每行写一个计算节点名，含作业的运行和备用节点 |
+| `--supernodes [JSON]` | 二选一 | 二选一 | 使用 Pod 分配和替补策略。兼容别名 `--supernodes-config`。配置文件优先取显式路径，其次取环境变量 `SUPERNODES_CONFIG`，最后取包内 `cluster_manager/config/supernodes.json` |
 | `--job_id` | 不需要 | 必填 | 已有 Slurm Job ID |
 | `--job_name` | 可选 | 必填 | Slurm 作业名；Slurm 模式必须与 sbatch 脚本一致 |
 | `--sbatch_script` | 不需要 | 必填 | Slurm 提交脚本 |
@@ -29,6 +32,22 @@ hcu-cluster-inspect \
   --exec /path/to/run.sh \
   --hostfile /path/to/hostfile
 ```
+
+### 超节点布置与恢复
+
+在裸机超节点模式下，作业独占 JSON 描述的所有 Pod。管理器按规则展开全部计算节点，并写入 `$WORK_DIR/workspace/allocation.hostfile`。在 Slurm 超节点模式下，管理器把 Job ID 实际获配的节点写入同一文件，并校验这些节点在 JSON 中的归属。每轮训练由管理器另行生成有序的 `slots_nodes.txt`，只列本轮参训节点和每节点 slots。
+
+包内示例用一条规则描述 p5、p6 两个物理 Pod，`p{pod}c{node}` 展开为每个 Pod 的 c0 至 c9。编号不连续时可写 `"pod_range": "5-6,9,12-14"`，其它命名方式可单独写规则。
+
+`spec` 使用 `M*N`，表示每 Pod 有 M 个计算节点、每节点有 N 张卡。`active_nodes_per_pod` 给出首次每 Pod 参训台数 A，另外 M−A 台留作本地备用。若配置包含 `local_standby_nodes_per_pod`，其值应等于 M−A。首次布置需要选中 Pod 的 M 台均在可用池中，作业的 `--nodes_num` 要能由完整的训练组组成，`--slots` 要在各参与节点的卡数范围内。
+
+```bash
+hcu-cluster-inspect --supernodes --nodes_num 8 --slots 4 --exec /shared/job/train.sh
+```
+
+若该作业获配 p5、p6 的全部 20 台，首次使用 p5c0 至 p5c7，并对 p5 全部 10 台执行健康检查。p5c2 隔离后，p5c8 接替第 3 个位置。若 p5c4、p5c5 随后同时隔离，p5 只剩 p5c9 一台备用，原有 8 个训练位置整体迁到 p6c0 至 p6c7。迁移目标的每节点卡数与源 Pod 相同，可用节点数和配置的训练台数上限均须容纳原组。恢复后本地备用可降到零。各轮训练名单的每行均为 `主机名 slots=4`，未迁移的组保留原顺序。若没有可接下整组的兼容 Pod，该轮分配失败，保留上次发布的训练名单。
+
+对于 4,000 张参训卡，同样的规则需要 125 个参训 Pod，参数为 `--nodes_num 1000 --slots 4`。首次用 8 备 2 需要获配 1,250 台、共 5,000 张物理卡。若还要在每个参训 Pod 都已布置作业时支持整组外迁，可以给作业多分配一个备用 Pod。
 
 ## 2. 核心环境变量
 
@@ -53,15 +72,15 @@ hcu-cluster-inspect --nodes_num 2 --slots 4 --mpi-ranks-per-node 1 \
 | MPI 直接每节点启动 4 个训练进程 | `4` | `4` |
 | MPI 直接每节点启动 8 个训练进程 | `8` | `8` |
 
-完成启动脚本中路径、镜像、hostfile 等必要配置后，可按实际 MPI 布局启动：
+配置好训练脚本和镜像后，启动脚本也需要显式选择节点来源。下面的普通节点池示例使用 `--hostfile`。
 
 ```bash
 # 每节点一个 torchrun：当前 DeepSeek 启动方式。
-MPI_RANKS_PER_NODE=1 bash start.sh
+MPI_RANKS_PER_NODE=1 bash start.sh --hostfile /shared/job/hostfile
 # Docker 模式，每节点一个 torchrun，申请 2 个节点，每节点 4 个训练进程。
-MPI_RANKS_PER_NODE=1 NODES_NUM=2 SLOTS=4 bash examples/start_docker.sh
+MPI_RANKS_PER_NODE=1 NODES_NUM=2 SLOTS=4 bash examples/start_docker.sh --hostfile /shared/job/hostfile
 # MPI 直接每节点启动 4 个训练进程，未设置 MPI_RANKS_PER_NODE 时默认跟随 SLOTS：
-NODES_NUM=2 SLOTS=4 bash examples/start_docker.sh
+NODES_NUM=2 SLOTS=4 bash examples/start_docker.sh --hostfile /shared/job/hostfile
 ```
 
 `MPI_RANKS_PER_NODE` 必须为正整数，只用于监控映射，不会改写训练脚本中的
@@ -77,7 +96,8 @@ NODES_NUM=2 SLOTS=4 bash examples/start_docker.sh
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `CLUSTER_LAUNCH_MODE` | `mpi` | 启动器类型；支持 `mpi`、`docker`（以及兼容别名 `docker_exec`） |
-| `CLUSTER_SCHEDULE` | `NONE` | `NONE` 表示裸机 hostfile，`SLURM` 表示 Slurm |
+| `CLUSTER_SCHEDULE` | `NONE` | `NONE` 表示裸机，`SLURM` 表示 Slurm |
+| `SUPERNODES_CONFIG` | 未设置 | 显式选择 `--supernodes` 时可用它指定 JSON 路径。使用 `--hostfile` 时必须取消设置 |
 | `WORK_DIR` | 当前目录 | 控制器工作目录；状态写入其 `workspace/` |
 | `LOG_DIR` | `${WORK_DIR}/hcu_megatron/examples/aibenchmark` | 训练日志目录 |
 | `MEGATRON_SCRIPT_PATH` | 空 | 训练参数来源，可指向 Shell、JSON 或 YAML 文件 |
@@ -102,7 +122,7 @@ Docker launcher 变量（仅 `CLUSTER_LAUNCH_MODE=docker` 使用）：
 | `DOCKER_IMAGE_TAR` / `IMAGE_TAR` | 空 | 镜像 tar 包；存在时优先 `docker load` |
 | `DOCKER_REUSE_CONTAINER` | `false` | 开启后复用同名容器：运行中直接使用，已停止则 `docker start`；不存在时按镜像配置创建。默认删除后重建 |
 | `DOCKER_EXEC_PATH` | `--exec` 的路径 | 容器内训练脚本路径；宿主机与容器路径不同时必须显式设置 |
-| `DOCKER_SLOTSFILE_PATH` | `--hostfile`/slots 文件路径 | 容器内可读的 slots 文件路径，通常要求挂载共享目录 |
+| `DOCKER_SLOTSFILE_PATH` | 本轮训练的 slots 文件路径 | 容器内可读的 slots 文件路径，通常要求挂载共享目录 |
 | `DOCKER_WORKDIR` | 训练脚本父目录 | 容器内执行 `bash` 前切换到的工作目录 |
 | `DOCKER_CONTAINER_SSH_PORT` | `36000` | 容器内 `sshd` 监听端口，供训练脚本的容器间 MPI 使用；这是容器端口，不是宿主机 SSH 端口 |
 | `MPI_HOST_SSH_PORT` | `22` | 连接训练宿主机的 SSH 端口；优先于旧变量 `MPIRUN_PLM_RSH_ARGS` |

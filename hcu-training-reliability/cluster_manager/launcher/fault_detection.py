@@ -32,6 +32,7 @@ class FaultDetection:
         self.last_fault_nodes = []
         self._state = defaultdict(dict)
         self._slurm_enabled = global_config.CLUSTER_SCHEDULE == "SLURM"
+        self.require_complete_nhc = False
 
     def parse_fault_log(self, log_str: str) -> Dict[str, Optional[str]]:
         """
@@ -175,11 +176,16 @@ class FaultDetection:
 
 
     def parse_clush_output(self, output: str) -> list[str]:
+        passed, _ = self._parse_nhc_results(output)
+        return passed
+
+    def _parse_nhc_results(self, output: str) -> tuple[list[str], list[str]]:
         """解析 clush 输出：
         1）PASSED → 直接通过
         2）仅包含 ib_pcs_link_down[HCAx] 且 Counter < 5 → 降级通过
         """
         passed_nodes = []
+        reported_nodes = []
 
         lines = output.splitlines()
         clean_lines = [line.strip() for line in lines if line.strip()]
@@ -265,13 +271,16 @@ class FaultDetection:
                             is_passed = True
 
                 # 记录通过节点
-                if is_passed:
-                    passed_nodes.extend(node_expr_parser(node_expr))
+                if result:
+                    hosts = node_expr_parser(node_expr)
+                    reported_nodes.extend(hosts)
+                    if is_passed:
+                        passed_nodes.extend(hosts)
 
             else:
                 i += 1
 
-        return passed_nodes
+        return passed_nodes, reported_nodes
 
     def cross_check(self, hostfile):
         normal_nodes = []
@@ -407,8 +416,14 @@ class FaultDetection:
                 self.write_run_nhc_error(output)
             return [], [], False
 
-        passed = self.parse_clush_output(output)
-        failed = [node for node in all_nodes if node not in passed]
+        passed, reported = self._parse_nhc_results(output)
+        if self.require_complete_nhc and (
+            len(reported) != len(all_nodes) or set(reported) != set(all_nodes)
+        ):
+            logger.warning("[run_nhc] Incomplete or duplicate host results; retry this probe")
+            return [], [], False
+        passed_set = set(passed)
+        failed = [node for node in all_nodes if node not in passed_set]
 
         if len(failed) > 0:
             self.write_run_nhc_error(output)

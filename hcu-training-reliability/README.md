@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # hcu-training-reliability：长稳训练监控与故障恢复
 
-`hcu-training-reliability` 运行在登录节点或控制节点上，为裸机 hostfile、Slurm 分配或预创建 Docker 容器中的分布式训练提供长稳运行保障。它维护训练节点池，持续监控训练日志和节点状态，并在检测到故障后选择备用节点重新拉起训练。
+`hcu-training-reliability` 运行在登录节点或控制节点上，为裸机或 Slurm 分配内的分布式训练提供长稳运行保障。它维护训练节点池，持续监控训练日志和节点状态，并在检测到故障后选择备用节点重新拉起训练。
 
 当前可用于生产的主路径包括 **裸金属 + MPI**、**Slurm + MPI**，以及在每个节点预先创建训练容器后的 **hostfile + Docker exec**。Kubernetes 训练容错请使用同级项目 [`hygon-ft-k8s`](../hygon-ft-k8s/README.md)。
 
@@ -23,7 +23,7 @@ SPDX-License-Identifier: Apache-2.0
 
 - 目标 Slurm 节点为本次训练独占，节点上没有其他 Python 任务。
 - Slurm 模式下，`--job_id` 对应的作业已存在或允许重新提交，作业名与 `--job_name` 一致。
-- Slurm 模式下，hostfile 中的运行节点和备用节点都属于该 Slurm 分配；裸机模式不使用 Slurm 参数。
+- Slurm 模式下，运行节点和备用节点都应属于该作业的实际分配。裸机超节点模式下，本作业独占拓扑 JSON 描述的全部 Pod。
 - 训练脚本已配置 checkpoint；本项目负责编排停止、换节点和重启，不负责保存 checkpoint。
 - 启动脚本应从本目录的 `examples/start_none.sh` 或 `examples/start_slurm.sh` 复制并按现场环境修改；不要与 `hygon-ft-k8s` 或其他项目的启动脚本混用。
 
@@ -46,7 +46,7 @@ python hcu-training-reliability/cluster_manager/main.py --help
 
 ```bash
 cd hcu-training-reliability
-cp examples/start_none.sh start.local.sh        # 裸机 hostfile
+cp examples/start_none.sh start.local.sh        # 裸机
 # 或
 cp examples/start_slurm.sh start.slurm.local.sh # Slurm
 # 或
@@ -63,14 +63,14 @@ cp examples/start_docker.sh start.docker.local.sh # 预创建容器 + Docker exe
 | `NODES_NUM` | 每轮训练需要的节点数 |
 | `SLOTS` | 每个节点启动的训练进程数 |
 | `RUN_PATH` | 真正执行训练的启动脚本；该脚本需要接收 slots hostfile 作为第一个参数 |
-| `HOSTFILE` | Slurm allocation 内的运行节点和备用节点列表 |
+| `--hostfile PATH` 或 `--supernodes [JSON]` | 启动时显式二选一。普通节点池使用 hostfile，超节点作业使用 JSON 的 Pod 规则 |
 | `JOB_ID` | 已存在的 Slurm Job ID |
 | `JOB_NAME` | Slurm 作业名，必须与 sbatch 脚本及 Slurm 队列中的名称一致 |
 | `SBATCH_SCRIPT` | 本次任务对应的 sbatch 脚本 |
 | Conda 配置 | `conda.sh` 路径和训练环境名称 |
 | 控制日志路径 | `nohup` 输出文件，建议放在 `WORK_DIR` 或独立日志目录 |
 | `LOG_PARSER_TYPE` | 日志解析器类型；默认 `base` 表示 Megatron 日志，其他特定训练框架日志使用 `special` |
-| `CLUSTER_SCHEDULE` | 调度场景；`NONE`（默认）表示裸机 hostfile，`SLURM` 表示 Slurm 作业 |
+| `CLUSTER_SCHEDULE` | 调度场景；`NONE`（默认）表示裸机，`SLURM` 表示 Slurm 作业 |
 
 MPI 生产路径配置：
 
@@ -100,7 +100,9 @@ SSH 认证连接到 hostfile 第一台训练节点，执行一次 `docker exec -
 `DOCKER_CONTAINER_SSH_PORT`（默认 `36000`）的 `sshd`。停止训练时默认只终止容器内与训练脚本同名的进程；如需同时删除容器，显式设置
 `DOCKER_REMOVE_CONTAINER_ON_STOP=true`。
 
-裸机场景只通过 hostfile 使用 `mpirun` 启动，不要求 `JOB_ID`、`JOB_NAME` 和 `SBATCH_SCRIPT`，也不会执行 `squeue`、`sinfo` 或 `scontrol`。使用 Slurm 时设置 `CLUSTER_SCHEDULE=SLURM`，此时三个 Slurm 参数均为必填项。完整示例见 `examples/start_none.sh` 和 `examples/start_slurm.sh`。
+裸机和 Slurm 训练都必须显式传入 `--hostfile PATH` 或 `--supernodes [JSON]`。仅设置 `SUPERNODES_CONFIG` 会报错，`SUPERNODES_CONFIG` 与 `--hostfile` 同用也会报错。选择 `--supernodes` 后，管理器依次使用命令行指定的 JSON、`SUPERNODES_CONFIG` 指定的 JSON 或包内的 `cluster_manager/config/supernodes.json`。
+
+裸机超节点模式从 JSON 展开全部计算节点。Slurm 超节点模式按 Job ID 获取实际分配并校验节点归属。两种模式都会生成 `$WORK_DIR/workspace/allocation.hostfile` 供节点池和容器准备用；训练脚本接收本轮实际参训节点的有序 slots 文件。使用 Slurm 时还需要设置 `CLUSTER_SCHEDULE=SLURM`，并传入 `--job_id`、`--job_name` 和 `--sbatch_script`。
 
 需要解析 `epoch ... loss=... num_updates=...` 等其他特定训练框架日志时，显式配置 `LOG_PARSER_TYPE=special`。其他值会被拒绝，避免配置拼写错误后静默选择错误解析器。
 
@@ -116,7 +118,7 @@ Slurm 启动脚本必须使用 `JOB_ID` 传递 `--job_id`，并显式传递 `--j
 
 ```bash
 bash -n start.local.sh
-bash start.local.sh
+bash start.local.sh --hostfile /shared/job/hostfile
 ```
 
 示例脚本以前台方式启动，便于首次验证；需要后台运行时，由现场进程管理方式接管。若使用包含 `nohup` 的完整 `start.sh` 模板，启动后检查控制日志：
