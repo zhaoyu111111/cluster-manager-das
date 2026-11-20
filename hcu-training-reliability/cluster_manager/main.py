@@ -38,6 +38,8 @@ from cluster_manager.controller.distributed_job_manager import DistributedJobMan
 from cluster_manager.config.global_config import logger
 import cluster_manager.config.global_config as global_config
 
+DEFAULT_SUPERNODES_CONFIG = os.path.join(os.path.dirname(__file__), "config", "supernodes.json")
+
 def validate_sbatch_script(script_path: str, expected_job_name: str, required_nodes_num: int) -> bool:
     """
     校验 sbatch 脚本中的作业名和节点数是否符合要求。
@@ -93,7 +95,13 @@ def parse_args():
              "required for MPI exit fallback, independent of --slots",
     )
     parser.add_argument("--exec", type=str, default=None, help="executable training script path")
-    parser.add_argument("--hostfile", type=str, default=None, help="hostfile path")
+    node_source = parser.add_mutually_exclusive_group()
+    node_source.add_argument("--hostfile", metavar="PATH", help="use the hostfile node pool")
+    node_source.add_argument(
+        "--supernodes", "--supernodes-config", dest="supernodes_config",
+        nargs="?", metavar="JSON", const=os.getenv("SUPERNODES_CONFIG") or DEFAULT_SUPERNODES_CONFIG,
+        help="use Pod placement; JSON defaults to SUPERNODES_CONFIG, then config/supernodes.json",
+    )
     parser.add_argument("--job_name", type=str, default=None, help="Job name for this training job")
     parser.add_argument("--job_id", type=str, default=None, help="existing slurm job id for this manager instance")
     parser.add_argument("--sbatch_script", type=str, default=None, help="sbatch script path for Slurm job submission")
@@ -123,6 +131,9 @@ def build_runtime_args(args) -> dict:
     mpi_ranks_per_node = getattr(args, "mpi_ranks_per_node", None)
     if mpi_ranks_per_node is not None:
         runtime_args["mpi_ranks_per_node"] = mpi_ranks_per_node
+    topology_path = getattr(args, "supernodes_config", None)
+    if topology_path:
+        runtime_args["supernodes_config"] = to_abs_path(topology_path)
     return runtime_args
 
 def to_abs_path(path: str) -> str:
@@ -154,11 +165,15 @@ def validate_training_args(args) -> str:
             f"CLUSTER_SCHEDULE must be NONE or SLURM, got: {schedule}"
         )
 
+    if args.hostfile and "SUPERNODES_CONFIG" in os.environ:
+        raise ValueError("--hostfile conflicts with SUPERNODES_CONFIG; unset it to use --hostfile")
+    if bool(args.hostfile) == bool(getattr(args, "supernodes_config", None)):
+        raise ValueError("Training requires exactly one node source: --hostfile PATH or --supernodes [JSON]")
+
     common_args = {
         "--nodes_num": args.nodes_num,
         "--slots": args.slots,
         "--exec": args.exec,
-        "--hostfile": args.hostfile,
     }
     missing = [name for name, value in common_args.items() if not value]
 
@@ -199,6 +214,11 @@ def validate_training_files(args, schedule: str) -> None:
     ):
         raise ValueError(f"Training script not found or unreadable: {args.exec}")
 
+    topology_path = getattr(args, "supernodes_config", None)
+    if topology_path:
+        if not os.path.isfile(topology_path) or not os.access(topology_path, os.R_OK):
+            raise ValueError(f"Supernode configuration not found or unreadable: {topology_path}")
+        return
     if schedule != "NONE":
         return
 

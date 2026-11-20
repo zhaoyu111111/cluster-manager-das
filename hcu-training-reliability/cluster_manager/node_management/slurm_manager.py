@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import sys
 from cluster_manager.config.global_config import logger
 from cluster_manager.executor.cmd_executor import CmdExecutor
+from cluster_manager.utils.file_utils import write_ordered_hostfile
 
 
 class SlurmMgr:
@@ -20,6 +21,7 @@ class SlurmMgr:
         self.job_name = job_name
         self.sbatch_script = sbatch_script
         self.hostfile = hostfile
+        self.refresh_allocation_hostfile = False
         hostfile_dir = os.path.dirname(os.path.abspath(hostfile)) if hostfile else os.getcwd()
         self.job_id_file = os.path.join(hostfile_dir, "slurm_job_id")
         self.current_job_id = job_id
@@ -238,15 +240,7 @@ class SlurmMgr:
         if not nodes:
             return False
 
-        try:
-            with open(self.hostfile, 'w') as f:
-                f.write("\n".join(nodes))
-            logger.info(f"Hostfile updated: {self.hostfile}")
-        except Exception as e:
-            logger.error(f"Write hostfile failed: {e}")
-            return False
-
-        return True
+        return self._write_allocation(nodes)
 
     def get_job_nodes(self, verbose: bool = True) -> Tuple[bool, List[str]]:
         """
@@ -295,15 +289,19 @@ class SlurmMgr:
             return False, []
 
     def update_hostfile(self, nodes: List[str]) -> bool:
-        return True
+        # Existing flat-pool jobs manage their own hostfile on reattachment.
+        if not self.refresh_allocation_hostfile:
+            return True
+        return self._write_allocation(nodes)
+
+    def _write_allocation(self, nodes: List[str]) -> bool:
         if not nodes:
             return False
         try:
-            with open(self.hostfile, 'w') as f:
-                f.write("\n".join(nodes))
+            write_ordered_hostfile(self.hostfile, nodes)
             logger.info(f"Hostfile updated with {len(nodes)} nodes: {self.hostfile}")
             return True
-        except Exception as e:
+        except OSError as e:
             logger.error(f"Write hostfile failed: {e}")
             return False
 

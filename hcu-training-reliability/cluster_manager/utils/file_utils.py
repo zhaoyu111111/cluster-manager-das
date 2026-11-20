@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 import os
+import stat
+import tempfile
 from collections import deque
+from contextlib import contextmanager
 from typing import List, Union, Optional
 from pathlib import Path
 from cluster_manager.config.global_config import logger
@@ -86,7 +89,39 @@ def write_slotsfile(filepath: Union[str, Path], host_list: List[str], slots_per_
         logger.error(f"写入slots文件失败: {e}")
 
 
-def read_hostfile(filepath: Union[str, Path]) -> List[str]:
+@contextmanager
+def atomic_text_file(filepath: Union[str, Path]):
+    """Replace a UTF-8 file after its complete contents have been written."""
+    path = Path(filepath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = tempfile.NamedTemporaryFile(
+        dir=path.parent, encoding="utf-8", mode="w", delete=False
+    )
+    temp_path = Path(temp.name)
+    try:
+        with temp:
+            yield temp
+        if path.exists():
+            os.chmod(temp_path, stat.S_IMODE(path.stat().st_mode))
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def write_ordered_hostfile(
+    filepath: Union[str, Path], hosts: List[str], slots_per_host: Optional[int] = None
+) -> None:
+    """Publish a complete rank-ordered hostfile. Write errors propagate to the caller."""
+    if slots_per_host is not None and slots_per_host <= 0:
+        raise ValueError("slots_per_host must be positive")
+    if len(hosts) != len(set(hosts)):
+        raise ValueError("Duplicate nodes in running layout")
+    suffix = "" if slots_per_host is None else f" slots={slots_per_host}"
+    with atomic_text_file(filepath) as stream:
+        stream.writelines(f"{host}{suffix}\n" for host in hosts)
+
+
+def read_hostfile(filepath: Union[str, Path], *, preserve_order: bool = False) -> List[str]:
     """
     读取主机文件，返回去重排序后的节点列表（兼容纯节点名或带slots的格式）
 
@@ -110,7 +145,7 @@ def read_hostfile(filepath: Union[str, Path]) -> List[str]:
             host = stripped_line.split()[0]
             if host:
                 hosts.append(host)
-        unique_hosts = sorted(set(hosts))
+        unique_hosts = list(dict.fromkeys(hosts)) if preserve_order else sorted(set(hosts))
         logger.debug(
             f"读取主机文件成功: {path.resolve()} "
             f"(共{len(unique_hosts)}个有效节点)"

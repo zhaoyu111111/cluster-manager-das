@@ -68,7 +68,8 @@ def expand_range(expr: str) -> List[str]:
                 start = int(start_str)
                 end = int(end_str)
                 # 确定数字位数（用于补零，如01→2位）
-                digit_len = max(len(start_str), len(end_str))
+                # clush uses [1-125] for unpadded names and [001-125] for padded names.
+                digit_len = len(start_str)
                 # 生成范围内所有数字（包含两端）
                 for num in range(start, end + 1):
                     # 按原始位数补零（如1→01）

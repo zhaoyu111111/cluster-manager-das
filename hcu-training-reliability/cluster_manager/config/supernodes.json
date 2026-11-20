@@ -1,0 +1,12 @@
+{
+  "rules": [
+    {
+      "pod_range": "5-6",
+      "pod_name": "p{pod}",
+      "spec": "10*4",
+      "node_name": "p{pod}c{node}",
+      "node_start": 0,
+      "active_nodes_per_pod": 8
+    }
+  ]
+}
